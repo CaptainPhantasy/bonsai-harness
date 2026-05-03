@@ -16,6 +16,7 @@ sandbox/*
 .env
 .env.*
 !.env.example
+!.env.local.example
 
 # OS and editor noise
 .DS_Store
