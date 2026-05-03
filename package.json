@@ -1,0 +1,25 @@
+{
+  "version": "0.1.0-beta.3",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "backend:dev": "cd backend && bun run dev",
+    "backend:test": "cd backend && bun test",
+    "backend:typecheck": "cd backend && bunx tsc --noEmit",
+    "frontend:dev": "cd frontend && bun run dev -- --host 127.0.0.1 --port 11432",
+    "frontend:lint": "cd frontend && bun run lint",
+    "frontend:build": "cd frontend && bun run build",
+    "smoke": "bun scripts/smoke-test.ts",
+    "bonsai:e2e": "bun scripts/bonsai-e2e.ts",
+    "verify:beta": "bun run backend:typecheck && bun run backend:test && bun run frontend:lint && bun run frontend:build"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "motion": "^12.38.0",
+    "react-markdown": "^10.1.0",
+    "recharts": "^3.8.1",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.5.0"
+  }
+}

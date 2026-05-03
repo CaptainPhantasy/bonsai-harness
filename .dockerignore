@@ -1,0 +1,9 @@
+.floyd/
+.git/
+.github/
+logs/
+sandbox/
+frontend/dist/
+**/node_modules/
+**/.env
+.DS_Store

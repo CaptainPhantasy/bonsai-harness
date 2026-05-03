@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PORT: "11431"
+      HARNESS_MAX_ACTIVE_AGENTS: "2"
+      HARNESS_SANDBOX_ROOT: /app/sandbox
+      HARNESS_RUNNER_BINARY: ${HARNESS_RUNNER_BINARY:-/bin/echo}
+      HARNESS_RUNNER_ARGS_TEMPLATE: "{{runtimeKind}} --model {{modelId}} --prompt {{prompt}}"
+      HARNESS_MODEL_CACHE_DIR: /app/models
+      HARNESS_CACHE_DIR: /app/mlx-cache
+    ports:
+      - "11431:11431"
+    volumes:
+      - ./logs:/app/logs
+      - ./sandbox:/app/sandbox
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r=await fetch('http://127.0.0.1:11431/health'); if(!r.ok) process.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    image: oven/bun:1
+    working_dir: /app/frontend
+    command: sh -lc "bun install --frozen-lockfile && bun run dev -- --host 0.0.0.0 --port 11432"
+    environment:
+      VITE_HARNESS_BACKEND_URL: http://localhost:11431
+    ports:
+      - "11432:11432"
+    volumes:
+      - ./frontend:/app/frontend
+    depends_on:
+      backend:
+        condition: service_healthy

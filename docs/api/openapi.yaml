@@ -1,0 +1,212 @@
+openapi: 3.1.0
+info:
+  title: Generic Model Harness API
+  version: 0.1.0-beta.1
+  summary: Local and OpenAI-compatible model orchestration harness API for beta verification.
+servers:
+  - url: http://localhost:11431
+    description: Claimed beta backend port
+paths:
+  /health:
+    get:
+      summary: Report harness health and runtime configuration without exposing secrets.
+      operationId: getHealth
+      responses:
+        "200":
+          description: Harness runtime status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/$defs/HealthPayload"
+  /mcp/local-fs:
+    post:
+      summary: Start the local filesystem MCP probe process.
+      operationId: connectLocalFilesystemMcp
+      responses:
+        "200":
+          description: MCP process accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+webhooks: {}
+$defs:
+  ModelRuntimeKind:
+    type: string
+    enum: [local-command, openai-compatible]
+  HealthPayload:
+    type: object
+    required:
+      - ok
+      - service
+      - port
+      - activeAgents
+      - maxActiveAgents
+      - mcpConnections
+      - modelId
+      - runtimeKind
+      - sandboxRoot
+    properties:
+      ok:
+        type: boolean
+      service:
+        type: string
+        const: bonsai-harness
+      port:
+        type: integer
+        minimum: 10000
+        maximum: 65535
+      activeAgents:
+        type: integer
+        minimum: 0
+      maxActiveAgents:
+        type: integer
+        minimum: 1
+        maximum: 16
+      mcpConnections:
+        type: integer
+        minimum: 0
+      modelId:
+        type: string
+      runtimeKind:
+        $ref: "#/$defs/ModelRuntimeKind"
+      sandboxRoot:
+        type: string
+      error:
+        type: string
+      runnerBinaryPath:
+        type: string
+      runnerBinaryPresent:
+        type: boolean
+      runnerArgsTemplate:
+        type: string
+      modelCacheDir:
+        type: string
+      cacheDir:
+        type: string
+      apiBaseUrl:
+        type: string
+      apiPath:
+        type: string
+      apiKeyPresent:
+        type: boolean
+      maxTokens:
+        type: number
+      temperature:
+        type: number
+  WebSocketClientMessage:
+    oneOf:
+      - $ref: "#/$defs/SpawnAgentMessage"
+      - $ref: "#/$defs/WriteSandboxMessage"
+  SpawnAgentMessage:
+    type: object
+    required: [action, agentId, prompt]
+    properties:
+      action:
+        type: string
+        const: spawn_agent
+      agentId:
+        type: string
+        minLength: 1
+      prompt:
+        type: string
+        minLength: 1
+      modelId:
+        type: string
+        description: Arbitrary model identifier passed to the selected runtime.
+      runtimeKind:
+        $ref: "#/$defs/ModelRuntimeKind"
+  WriteSandboxMessage:
+    type: object
+    required: [action, filename, content]
+    properties:
+      action:
+        type: string
+        const: write_sandbox
+      filename:
+        type: string
+        minLength: 1
+      content:
+        type: string
+  HarnessEvent:
+    oneOf:
+      - $ref: "#/$defs/StatusEvent"
+      - $ref: "#/$defs/ErrorEvent"
+      - $ref: "#/$defs/InferenceEvent"
+      - $ref: "#/$defs/AgentExitEvent"
+      - $ref: "#/$defs/McpResponseEvent"
+      - $ref: "#/$defs/SandboxWriteEvent"
+  StatusEvent:
+    type: object
+    required: [type, payload]
+    properties:
+      type:
+        type: string
+        const: status
+      payload:
+        type: string
+  ErrorEvent:
+    type: object
+    required: [type, payload]
+    properties:
+      type:
+        type: string
+        const: error
+      payload:
+        type: string
+      agentId:
+        type: string
+  InferenceEvent:
+    type: object
+    required: [type, agentId, payload]
+    properties:
+      type:
+        type: string
+        const: inference
+      agentId:
+        type: string
+      payload:
+        type: string
+  AgentExitEvent:
+    type: object
+    required: [type, agentId, code, signal]
+    properties:
+      type:
+        type: string
+        const: agent_exit
+      agentId:
+        type: string
+      code:
+        type:
+          - integer
+          - "null"
+      signal:
+        type:
+          - string
+          - "null"
+  McpResponseEvent:
+    type: object
+    required: [type, server, payload]
+    properties:
+      type:
+        type: string
+        const: mcp_response
+      server:
+        type: string
+      payload:
+        type: string
+  SandboxWriteEvent:
+    type: object
+    required: [type, path, payload]
+    properties:
+      type:
+        type: string
+        const: sandbox_write
+      path:
+        type: string
+      payload:
+        type: string

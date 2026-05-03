@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.legacyai.bonsaiharness</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Volumes/SanDisk1Tb/bonsai-harness/scripts/start-backend.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Volumes/SanDisk1Tb/bonsai-harness</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/bonsai-harness.launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/bonsai-harness.launchd.error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/douglastalley</string>
+        <key>USER</key>
+        <string>douglastalley</string>
+        <key>LOGNAME</key>
+        <string>douglastalley</string>
+        <key>SHELL</key>
+        <string>/bin/zsh</string>
+        <key>TMPDIR</key>
+        <string>/tmp</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+        <key>__CF_USER_TEXT_ENCODING</key>
+        <string>0x1F5:0x0:0x0</string>
+        <key>PATH</key>
+        <string>/Users/douglastalley/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PORT</key>
+        <string>11431</string>
+        <key>HARNESS_SANDBOX_ROOT</key>
+        <string>/Volumes/SanDisk1Tb/bonsai-harness/sandbox</string>
+        <key>HARNESS_RUNTIME_KIND</key>
+        <string>local-command</string>
+        <key>HARNESS_MODEL_ID</key>
+        <string>prism-ml/Ternary-Bonsai-8B-mlx-2bit</string>
+    </dict>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+</dict>
+</plist>

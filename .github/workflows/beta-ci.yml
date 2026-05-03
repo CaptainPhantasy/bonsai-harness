@@ -1,0 +1,47 @@
+name: Beta CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - beta
+
+jobs:
+  verify:
+    name: Typecheck, test, lint, and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: bun install --frozen-lockfile
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck backend
+        working-directory: backend
+        run: bunx tsc --noEmit
+
+      - name: Test backend
+        working-directory: backend
+        run: bun test
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: bun run lint
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_HARNESS_BACKEND_URL: http://localhost:11431
+        run: bun run build
