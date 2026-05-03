@@ -5,73 +5,136 @@ import { mkdir } from "node:fs/promises";
 import {
   assertExecutableExists,
   assertSpawnCapacity,
-  buildSpawnArguments,
+  buildLocalCommandArguments,
+  buildOpenAiCompatibleRequest,
   createSandboxPath,
   healthPayload,
   parseClientMessage,
-  resolveDefaultModelId,
-  resolvePort,
+  resolveApiKey,
   resolveMaxActiveAgents,
-  resolveMlxBinaryPath,
-  resolveRunnerKind,
+  resolveModelRuntime,
+  resolvePort,
   resolveSandboxRoot,
   type HarnessEvent,
+  type OpenAiCompatibleRuntime,
 } from "./src/server-core";
 
 type ClientSocket = ServerWebSocket<unknown>;
+type RunningAgent = { stop: (signal?: NodeJS.Signals) => void };
 
 const PORT = resolvePort(process.env);
 const MAX_ACTIVE_AGENTS = resolveMaxActiveAgents(process.env);
 const clients = new Set<ClientSocket>();
-const activeAgents = new Map<string, ChildProcessWithoutNullStreams>();
+const activeAgents = new Map<string, RunningAgent>();
 const mcpConnections = new Map<string, ChildProcessWithoutNullStreams>();
 
 const SANDBOX_ROOT = resolveSandboxRoot(process.env);
 await mkdir(SANDBOX_ROOT, { recursive: true });
 await mkdir("/Volumes/SanDisk1Tb/bonsai-harness/logs", { recursive: true });
 
-function spawnBonsaiInstance(agentId: string, rolePrompt: string, modelId = resolveDefaultModelId(process.env)) {
+function spawnHarnessAgent(
+  agentId: string,
+  rolePrompt: string,
+  requested: { modelId?: string | undefined; runtimeKind?: "local-command" | "openai-compatible" | undefined } = {},
+) {
   if (activeAgents.has(agentId)) {
     throw new Error(`Agent ${agentId} is already active`);
   }
   assertSpawnCapacity(activeAgents.size, MAX_ACTIVE_AGENTS);
 
-  const mlxBinaryPath = resolveMlxBinaryPath(process.env);
-  const runnerKind = resolveRunnerKind(process.env);
-  assertExecutableExists(mlxBinaryPath);
+  const runtime = resolveModelRuntime(process.env, requested);
 
-  console.log(`[EXO] Spawning ${agentId} with ${modelId} via ${runnerKind}:${mlxBinaryPath}`);
-  const bonsaiProcess = spawn(mlxBinaryPath, buildSpawnArguments(modelId, rolePrompt, runnerKind), {
-    env: {
-      ...process.env,
-      // Keep tokenizer/model caches off the system disk when the real SLM runner is configured.
-      HF_HOME: process.env.HF_HOME ?? "/Volumes/SanDisk1Tb/HFModels",
-      MLX_CACHE_DIR: process.env.MLX_CACHE_DIR ?? "/Volumes/SanDisk1Tb/mlx-cache",
-    },
-  });
+  if (runtime.kind === "local-command") {
+    assertExecutableExists(runtime.runnerBinaryPath);
+    const args = buildLocalCommandArguments(
+      runtime.runnerArgsTemplate,
+      runtime.modelId,
+      rolePrompt,
+      runtime.cacheDir,
+      runtime.modelCacheDir,
+      runtime.kind,
+    );
 
-  activeAgents.set(agentId, bonsaiProcess);
-  broadcast({ type: "status", payload: `Spawned ${agentId}` });
+    console.log(`[HARNESS] Spawning ${agentId} with ${runtime.modelId} via ${runtime.kind}:${runtime.runnerBinaryPath}`);
+    const child = spawn(runtime.runnerBinaryPath, args, {
+      env: {
+        ...process.env,
+        HF_HOME: runtime.modelCacheDir,
+        MLX_CACHE_DIR: runtime.cacheDir,
+      },
+    });
 
-  bonsaiProcess.stdout.on("data", (data: Buffer) => {
-    broadcast({ type: "inference", agentId, payload: data.toString() });
-  });
+    activeAgents.set(agentId, { stop: (signal = "SIGTERM") => child.kill(signal) });
+    broadcast({ type: "status", payload: `Spawned ${agentId} (${runtime.kind}:${runtime.modelId})` });
 
-  bonsaiProcess.stderr.on("data", (data: Buffer) => {
-    broadcast({ type: "error", agentId, payload: data.toString() });
-  });
+    child.stdout.on("data", (data: Buffer) => {
+      broadcast({ type: "inference", agentId, payload: data.toString() });
+    });
 
-  bonsaiProcess.on("error", (error) => {
+    child.stderr.on("data", (data: Buffer) => {
+      const text = data.toString();
+      if (isHfCacheNoise(text)) return;
+      broadcast({ type: "error", agentId, payload: text });
+    });
+
+    child.on("error", (error) => {
+      activeAgents.delete(agentId);
+      broadcast({ type: "error", agentId, payload: error.message });
+    });
+
+    child.on("close", (code, signal) => {
+      activeAgents.delete(agentId);
+      broadcast({ type: "agent_exit", agentId, code, signal });
+    });
+
+    return;
+  }
+
+  console.log(`[HARNESS] Spawning ${agentId} with ${runtime.modelId} via ${runtime.kind}:${runtime.apiBaseUrl}`);
+  const controller = new AbortController();
+  const API_TIMEOUT_MS = 60_000;
+  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  activeAgents.set(agentId, { stop: () => { clearTimeout(timeoutId); controller.abort(); } });
+  broadcast({ type: "status", payload: `Spawned ${agentId} (${runtime.kind}:${runtime.modelId})` });
+  void runOpenAiCompatibleAgent(agentId, rolePrompt, runtime, controller, timeoutId);
+}
+
+async function runOpenAiCompatibleAgent(
+  agentId: string,
+  rolePrompt: string,
+  runtime: OpenAiCompatibleRuntime,
+  controller: AbortController,
+  timeoutId: ReturnType<typeof setTimeout>,
+) {
+  let exitCode = 0;
+  try {
+    const { url, body } = buildOpenAiCompatibleRequest(runtime, rolePrompt);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${resolveApiKey(process.env)}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(`API runtime failed with HTTP ${response.status}: ${responseText}`);
+    }
+    const responseJson = JSON.parse(responseText) as unknown;
+    broadcast({ type: "inference", agentId, payload: extractOpenAiCompatibleContent(responseJson) });
+  } catch (error) {
+    exitCode = 1;
+    const payload = error instanceof Error && error.name === "AbortError"
+      ? "API runtime aborted"
+      : error instanceof Error ? error.message : String(error);
+    broadcast({ type: "error", agentId, payload });
+  } finally {
+    clearTimeout(timeoutId);
     activeAgents.delete(agentId);
-    broadcast({ type: "error", agentId, payload: error.message });
-  });
-
-  bonsaiProcess.on("close", (code, signal) => {
-    activeAgents.delete(agentId);
-    broadcast({ type: "agent_exit", agentId, code, signal });
-  });
-
-  return bonsaiProcess;
+    broadcast({ type: "agent_exit", agentId, code: exitCode, signal: null });
+  }
 }
 
 function connectLocalMCPServer(serverName: string, startCommand: string[]) {
@@ -105,22 +168,37 @@ async function writeToSandbox(filename: string, content: string) {
   return safePath;
 }
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+function cors(response: Response): Response {
+  for (const [k, v] of Object.entries(CORS_HEADERS)) response.headers.set(k, v);
+  return response;
+}
+
 serve({
   port: PORT,
   fetch(req, server) {
     const url = new URL(req.url);
 
+    if (req.method === "OPTIONS") {
+      return cors(new Response(null, { status: 204 }));
+    }
+
     if (url.pathname === "/health") {
-      return Response.json(healthPayload(activeAgents.size, mcpConnections.size, process.env));
+      return cors(Response.json(healthPayload(activeAgents.size, mcpConnections.size, process.env)));
     }
 
     if (url.pathname === "/mcp/local-fs" && req.method === "POST") {
       connectLocalMCPServer("Local-FS-Server", ["/usr/bin/env", "bash", "-lc", "pwd"]);
-      return Response.json({ ok: true });
+      return cors(Response.json({ ok: true }));
     }
 
-    if (server.upgrade(req)) return undefined;
-    return new Response("Bonsai Harness Orchestrator Online", { status: 200 });
+    if (server.upgrade(req, { headers: CORS_HEADERS })) return undefined;
+    return cors(new Response("Bonsai Harness Online", { status: 200 }));
   },
   websocket: {
     open(ws) {
@@ -131,7 +209,13 @@ serve({
       try {
         const req = parseClientMessage(message);
         if (req.action === "spawn_agent") {
-          spawnBonsaiInstance(req.agentId, req.prompt, req.modelId);
+          spawnHarnessAgent(req.agentId, req.prompt, { modelId: req.modelId, runtimeKind: req.runtimeKind });
+          return;
+        }
+
+        if (req.action === "send_message") {
+          const chatId = `Chat-${Date.now().toString(36)}`;
+          spawnHarnessAgent(chatId, req.payload);
           return;
         }
 
@@ -155,11 +239,37 @@ function broadcast(msg: HarnessEvent) {
   }
 }
 
+function extractOpenAiCompatibleContent(value: unknown): string {
+  if (isRecord(value)) {
+    const choices = value.choices;
+    if (Array.isArray(choices) && choices.length > 0 && isRecord(choices[0])) {
+      const message = choices[0].message;
+      if (isRecord(message) && typeof message.content === "string") {
+        return message.content;
+      }
+      if (typeof choices[0].text === "string") {
+        return choices[0].text;
+      }
+    }
+  }
+  return JSON.stringify(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isHfCacheNoise(text: string): boolean {
+  return text.includes("Fetching") && /\d+ file/.test(text)
+    || /^\s*$/.test(text)
+    || (text.includes("model.safetensors") && text.includes("%"));
+}
+
 process.on("SIGTERM", () => {
-  for (const child of activeAgents.values()) child.kill("SIGTERM");
+  for (const agent of activeAgents.values()) agent.stop("SIGTERM");
   for (const child of mcpConnections.values()) child.kill("SIGTERM");
   process.exit(0);
 });
 
-console.log(`Enterprise Harness listening on ws://localhost:${PORT}`);
+console.log(`Bonsai Harness listening on ws://localhost:${PORT}`);
 console.log(`Health check available at http://localhost:${PORT}/health`);
