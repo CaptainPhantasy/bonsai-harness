@@ -4,7 +4,7 @@ import {
   CalendarCheck, ListChecks, WandSparkles, Archive,
   Plus, Send, Settings, Terminal, Zap, X, Search, Sun, Moon,
   Copy, Check, ThumbsUp, ThumbsDown, Download, Keyboard, Maximize2, Minimize2,
-  Square, Trash2, Pencil, Paperclip, Sparkles, AlertCircle, FileText,
+  Square, Trash2, Pencil, Paperclip, Sparkles, AlertCircle, FileText, Key,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -13,7 +13,7 @@ import { useLocalStorage, useSystemTheme, useScrollPosition } from './hooks/useL
 
 /* ── Types ── */
 type Agent = { id: string; status: 'idle' | 'active' | 'exited' | 'error'; modelId?: string; runtimeKind?: RuntimeKind }
-type RuntimeKind = 'local-command' | 'openai-compatible'
+type RuntimeKind = 'local-command' | 'openai-compatible' | 'anthropic'
 type HarnessEvent =
   | { type: 'status'; payload: string }
   | { type: 'error'; payload: string; agentId?: string }
@@ -41,6 +41,12 @@ type Conversation = {
   updatedAt: number
 }
 
+type ProviderSettings = {
+  runtimeKind: RuntimeKind
+  openai: { apiBaseUrl: string; apiPath: string; apiKey: string; maxTokens: string; temperature: string; apiKeySet: boolean }
+  anthropic: { apiBaseUrl: string; apiKey: string; maxTokens: string; temperature: string; apiKeySet: boolean }
+}
+
 /* ── Constants ── */
 const RECONNECT_BASE_MS = 1_000
 const RECONNECT_MAX_MS = 30_000
@@ -50,6 +56,7 @@ const MAX_INPUT_CHARS = 8_000
 const DEFAULT_BACKEND_URL = 'http://localhost:11431'
 const DEFAULT_MODEL_ID = 'prism-ml/Ternary-Bonsai-8B-mlx-2bit'
 const DEFAULT_PROMPT = 'You are a deterministic code generation agent optimized for concise inference.'
+const ASSET_BASE = import.meta.env.BASE_URL
 
 const PRESET_MODELS = [
   { id: 'prism-ml/Ternary-Bonsai-8B-mlx-2bit', label: 'Ternary Bonsai 8B', description: '2-bit MLX, low memory' },
@@ -474,6 +481,10 @@ export default function HarnessDashboard() {
   const [paletteIndex, setPaletteIndex] = useState(0)
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
+  const [providerSettings, setProviderSettings] = useState<ProviderSettings | null>(null)
+  const [settingsSaving, setSettingsSaving] = useState(false)
+  const [settingsLoaded, setSettingsLoaded] = useState(false)
+  const [mcpConnected, setMcpConnected] = useState(false)
   const systemTheme = useSystemTheme()
   const effectiveLight = isLight || (theme !== 'bonsai' && systemTheme === 'light')
 
@@ -571,6 +582,36 @@ export default function HarnessDashboard() {
     return () => { disposed = true; clearInterval(id) }
   }, [backendHttpUrl])
 
+  /* ── Provider Settings Fetch ── */
+  useEffect(() => {
+    if (sidebarView !== 'settings' || settingsLoaded) return
+    fetch(`${backendHttpUrl}/api/settings`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (!data) return
+        setProviderSettings({
+          runtimeKind: data.runtimeKind as RuntimeKind,
+          openai: {
+            apiBaseUrl: data.openai?.apiBaseUrl ?? '',
+            apiPath: data.openai?.apiPath ?? '/v1/chat/completions',
+            apiKey: '',
+            maxTokens: String(data.openai?.maxTokens ?? 512),
+            temperature: String(data.openai?.temperature ?? 0.2),
+            apiKeySet: data.openai?.apiKeySet ?? false,
+          },
+          anthropic: {
+            apiBaseUrl: data.anthropic?.apiBaseUrl ?? 'https://api.anthropic.com',
+            apiKey: '',
+            maxTokens: String(data.anthropic?.maxTokens ?? 1024),
+            temperature: String(data.anthropic?.temperature ?? 0.7),
+            apiKeySet: data.anthropic?.apiKeySet ?? false,
+          },
+        })
+        setSettingsLoaded(true)
+      })
+      .catch(() => {})
+  }, [sidebarView, settingsLoaded, backendHttpUrl])
+
   /* ── Auto-scroll with user override ── */
   useEffect(() => {
     if (!isScrolledUp && chatContainerRef.current) {
@@ -654,6 +695,60 @@ export default function HarnessDashboard() {
   const toggleSidebar = useCallback(() => {
     setSidebarOpen((v) => !v)
   }, [setSidebarOpen])
+
+  const saveProviderSettings = useCallback(async () => {
+    if (!providerSettings) return
+    setSettingsSaving(true)
+    try {
+      const body: Record<string, unknown> = {
+        runtimeKind: providerSettings.runtimeKind,
+        modelId,
+        openai: {
+          apiBaseUrl: providerSettings.openai.apiBaseUrl,
+          apiPath: providerSettings.openai.apiPath,
+          maxTokens: Number(providerSettings.openai.maxTokens) || 512,
+          temperature: Number(providerSettings.openai.temperature) || 0.2,
+        },
+        anthropic: {
+          apiBaseUrl: providerSettings.anthropic.apiBaseUrl,
+          maxTokens: Number(providerSettings.anthropic.maxTokens) || 1024,
+          temperature: Number(providerSettings.anthropic.temperature) || 0.7,
+        },
+      }
+      if (providerSettings.openai.apiKey) (body.openai as Record<string, unknown>).apiKey = providerSettings.openai.apiKey
+      if (providerSettings.anthropic.apiKey) (body.anthropic as Record<string, unknown>).apiKey = providerSettings.anthropic.apiKey
+
+      const res = await fetch(`${backendHttpUrl}/api/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) throw new Error(`Save failed: HTTP ${res.status}`)
+      const data = await res.json()
+      setProviderSettings((prev) => prev ? {
+        ...prev,
+        runtimeKind: data.runtimeKind as RuntimeKind,
+        openai: { ...prev.openai, apiKey: '', apiKeySet: data.openai?.apiKeySet ?? prev.openai.apiKeySet, apiBaseUrl: data.openai?.apiBaseUrl ?? prev.openai.apiBaseUrl, apiPath: data.openai?.apiPath ?? prev.openai.apiPath, maxTokens: String(data.openai?.maxTokens ?? prev.openai.maxTokens), temperature: String(data.openai?.temperature ?? prev.openai.temperature) },
+        anthropic: { ...prev.anthropic, apiKey: '', apiKeySet: data.anthropic?.apiKeySet ?? prev.anthropic.apiKeySet, apiBaseUrl: data.anthropic?.apiBaseUrl ?? prev.anthropic.apiBaseUrl, maxTokens: String(data.anthropic?.maxTokens ?? prev.anthropic.maxTokens), temperature: String(data.anthropic?.temperature ?? prev.anthropic.temperature) },
+      } : prev)
+      setRuntimeKind(data.runtimeKind as RuntimeKind)
+      toast.success('Settings saved')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to save settings')
+    } finally {
+      setSettingsSaving(false)
+    }
+  }, [providerSettings, modelId, backendHttpUrl, setRuntimeKind])
+
+  const connectMCP = useCallback(() => {
+    fetch(`${backendHttpUrl}/mcp/local-fs`, { method: 'POST' })
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (data?.ok) { setMcpConnected(true); toast.success('MCP Local-FS-Server connected') }
+        else toast.error('Failed to connect MCP server')
+      })
+      .catch(() => toast.error('Failed to connect MCP server'))
+  }, [backendHttpUrl])
 
   /* ── Message Actions ── */
   const copyMessage = useCallback(async (content: string) => {
@@ -920,7 +1015,7 @@ export default function HarnessDashboard() {
               <span className="traffic-light traffic-light-maximize" />
             </div>
             <div className="ml-2 flex items-center gap-2">
-              <img src="/bonsailogo.png" alt="Bonsai" className="h-6 w-6 rounded-md object-cover" />
+              <img src={`${ASSET_BASE}bonsailogo.png`} alt="Bonsai" className="h-6 w-6 rounded-md object-cover" />
               <span className="text-[14px] font-semibold tracking-tight text-mm-text">Bonsai</span>
             </div>
           </div>
@@ -976,9 +1071,14 @@ export default function HarnessDashboard() {
             ))}
 
             <SectionHeader label="MCP Bus" />
-            <div className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] text-mm-text-secondary">
+            <button
+              onClick={connectMCP}
+              className="nav-item-transition flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] text-mm-text-secondary hover:bg-mm-surface-hover"
+              title={mcpConnected ? 'Local-FS-Server connected' : 'Click to connect Local-FS-Server'}
+            >
               <FolderOpen size={16} /> Local-FS-Server
-            </div>
+              {mcpConnected && <Circle size={6} className="ml-auto shrink-0 fill-mm-green text-mm-green" />}
+            </button>
 
             <div className="mt-4">
               <button
@@ -1006,7 +1106,7 @@ export default function HarnessDashboard() {
             </div>
             <div className="mt-2 flex items-center gap-2">
               <button onClick={toggleTheme} className="nav-item-transition flex items-center gap-1.5 rounded-full bg-mm-surface px-3 py-1 text-[11px] text-mm-text-secondary hover:bg-mm-surface-hover hover:text-mm-text">
-                <img src="/bonsailogo.png" alt="" className="h-3 w-3 rounded-sm object-cover" />
+                <img src={`${ASSET_BASE}bonsailogo.png`} alt="" className="h-3 w-3 rounded-sm object-cover" />
                 {theme === 'minimax' ? 'Bonsai' : 'MiniMax'}
               </button>
               <button onClick={toggleLight} className="nav-item-transition flex items-center gap-1.5 rounded-full bg-mm-surface px-3 py-1 text-[11px] text-mm-text-secondary hover:bg-mm-surface-hover hover:text-mm-text" aria-label="Toggle light/dark mode">
@@ -1058,7 +1158,9 @@ export default function HarnessDashboard() {
             runtimeKind={runtimeKind} setRuntimeKind={setRuntimeKind}
             prompt={prompt} setPrompt={setPrompt}
             health={health} activeCount={activeCount} canSpawn={canSpawn} onSpawn={spawnAgent}
-            onBack={() => setSidebarView('agents')}
+            onBack={() => { setSidebarView('agents'); setSettingsLoaded(false) }}
+            providerSettings={providerSettings} setProviderSettings={setProviderSettings}
+            settingsSaving={settingsSaving} onSaveSettings={saveProviderSettings}
           />
         ) : sidebarView === 'skills' ? (
           <PlaceholderPanel title="Skills" icon={<ListChecks size={20} />} onBack={() => setSidebarView('agents')} />
@@ -1115,7 +1217,7 @@ export default function HarnessDashboard() {
               </div>
             ) : (
               <div className="flex flex-1 flex-col items-center justify-center px-8">
-                <img src="/bonsailogo.png" alt="Bonsai" className="mb-5 h-14 w-14 rounded-2xl object-cover" />
+                <img src={`${ASSET_BASE}bonsailogo.png`} alt="Bonsai" className="mb-5 h-14 w-14 rounded-2xl object-cover" />
                 <h1 className="mb-3 text-[24px] font-semibold tracking-tight text-mm-text">
                   Bonsai makes your work easier.
                 </h1>
@@ -1354,13 +1456,30 @@ export default function HarnessDashboard() {
 function SettingsPanel({
   modelId, setModelId, runtimeKind, setRuntimeKind, prompt, setPrompt,
   health, activeCount, canSpawn, onSpawn, onBack,
+  providerSettings, setProviderSettings, settingsSaving, onSaveSettings,
 }: {
   modelId: string; setModelId: (v: string) => void
   runtimeKind: RuntimeKind; setRuntimeKind: (v: RuntimeKind) => void
   prompt: string; setPrompt: (v: string) => void
   health: Record<string, unknown> | null; activeCount: number
   canSpawn: boolean; onSpawn: () => void; onBack: () => void
+  providerSettings: ProviderSettings | null
+  setProviderSettings: React.Dispatch<React.SetStateAction<ProviderSettings | null>>
+  settingsSaving: boolean; onSaveSettings: () => void
 }) {
+  const updateOpenai = (field: keyof ProviderSettings['openai'], value: string) =>
+    setProviderSettings((prev) => prev ? { ...prev, openai: { ...prev.openai, [field]: value } } : prev)
+  const updateAnthropic = (field: keyof ProviderSettings['anthropic'], value: string) =>
+    setProviderSettings((prev) => prev ? { ...prev, anthropic: { ...prev.anthropic, [field]: value } } : prev)
+  const handleRuntimeChange = (v: RuntimeKind) => {
+    setRuntimeKind(v)
+    setProviderSettings((prev) => prev ? { ...prev, runtimeKind: v } : prev)
+  }
+
+  const showOpenai = runtimeKind === 'openai-compatible'
+  const showAnthropic = runtimeKind === 'anthropic'
+  const inputCls = 'w-full rounded-xl border border-mm-border bg-mm-surface px-4 py-2.5 text-[14px] text-mm-text outline-none transition focus:border-mm-accent'
+
   return (
     <div className="panel-animate-in flex-1 overflow-y-auto px-8 py-6 custom-scrollbar">
       <div className="mx-auto max-w-xl">
@@ -1372,38 +1491,87 @@ function SettingsPanel({
 
         <div className="space-y-5">
           <Field label="Model ID" hint="Any local or API model identifier accepted by the selected runtime.">
-            <input
-              value={modelId}
-              onChange={(e) => setModelId(e.target.value)}
-              className="w-full rounded-xl border border-mm-border bg-mm-surface px-4 py-2.5 text-[14px] text-mm-text outline-none transition focus:border-mm-accent"
-            />
+            <input value={modelId} onChange={(e) => setModelId(e.target.value)} className={inputCls} />
           </Field>
 
           <Field label="Runtime">
-            <select
-              value={runtimeKind}
-              onChange={(e) => setRuntimeKind(e.target.value as RuntimeKind)}
-              className="w-full rounded-xl border border-mm-border bg-mm-surface px-4 py-2.5 text-[14px] text-mm-text outline-none transition focus:border-mm-accent"
-            >
+            <select value={runtimeKind} onChange={(e) => handleRuntimeChange(e.target.value as RuntimeKind)} className={inputCls}>
               <option value="local-command">Local command</option>
               <option value="openai-compatible">OpenAI-compatible API</option>
+              <option value="anthropic">Anthropic API</option>
             </select>
           </Field>
 
+          {(showOpenai || showAnthropic) && providerSettings && (
+            <div className="rounded-xl border border-mm-border bg-mm-surface p-5">
+              <h3 className="mb-4 flex items-center gap-2 text-[13px] font-medium uppercase tracking-wider text-mm-text-tertiary">
+                <Key size={14} /> Provider Configuration
+              </h3>
+              <div className="space-y-4">
+                {showOpenai && (
+                  <>
+                    <Field label="API Base URL">
+                      <input value={providerSettings.openai.apiBaseUrl} onChange={(e) => updateOpenai('apiBaseUrl', e.target.value)} className={inputCls} placeholder="https://api.openai.com" />
+                    </Field>
+                    <Field label="API Path">
+                      <input value={providerSettings.openai.apiPath} onChange={(e) => updateOpenai('apiPath', e.target.value)} className={inputCls} placeholder="/v1/chat/completions" />
+                    </Field>
+                    <Field label={`API Key ${providerSettings.openai.apiKeySet ? '✓ Set' : '⚠ Not set'}`}>
+                      <input type="password" value={providerSettings.openai.apiKey} onChange={(e) => updateOpenai('apiKey', e.target.value)} className={inputCls} placeholder={providerSettings.openai.apiKeySet ? '•••••••• (enter new to replace)' : 'sk-...'} />
+                    </Field>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field label="Max Tokens">
+                        <input type="number" value={providerSettings.openai.maxTokens} onChange={(e) => updateOpenai('maxTokens', e.target.value)} className={inputCls} />
+                      </Field>
+                      <Field label="Temperature">
+                        <input type="number" step="0.1" value={providerSettings.openai.temperature} onChange={(e) => updateOpenai('temperature', e.target.value)} className={inputCls} />
+                      </Field>
+                    </div>
+                  </>
+                )}
+                {showAnthropic && (
+                  <>
+                    <Field label="API Base URL">
+                      <input value={providerSettings.anthropic.apiBaseUrl} onChange={(e) => updateAnthropic('apiBaseUrl', e.target.value)} className={inputCls} placeholder="https://api.anthropic.com" />
+                    </Field>
+                    <Field label={`API Key ${providerSettings.anthropic.apiKeySet ? '✓ Set' : '⚠ Not set'}`}>
+                      <input type="password" value={providerSettings.anthropic.apiKey} onChange={(e) => updateAnthropic('apiKey', e.target.value)} className={inputCls} placeholder={providerSettings.anthropic.apiKeySet ? '•••••••• (enter new to replace)' : 'sk-ant-...'} />
+                    </Field>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field label="Max Tokens">
+                        <input type="number" value={providerSettings.anthropic.maxTokens} onChange={(e) => updateAnthropic('maxTokens', e.target.value)} className={inputCls} />
+                      </Field>
+                      <Field label="Temperature">
+                        <input type="number" step="0.1" value={providerSettings.anthropic.temperature} onChange={(e) => updateAnthropic('temperature', e.target.value)} className={inputCls} />
+                      </Field>
+                    </div>
+                  </>
+                )}
+                <button
+                  onClick={onSaveSettings}
+                  disabled={settingsSaving}
+                  className="nav-item-transition w-full rounded-xl bg-mm-accent px-4 py-2.5 text-[14px] font-medium text-white hover:bg-mm-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {settingsSaving ? 'Saving...' : 'Save Settings'}
+                </button>
+                <p className="text-center text-[12px] text-mm-text-tertiary">
+                  Keys are stored in <code className="text-mm-accent">.env.local</code> on the backend
+                </p>
+              </div>
+            </div>
+          )}
+
+          {(showOpenai || showAnthropic) && !providerSettings && (
+            <div className="rounded-xl border border-mm-border bg-mm-surface p-5 text-center text-[13px] text-mm-text-secondary">
+              Loading provider settings...
+            </div>
+          )}
+
           <Field label="System Prompt">
-            <textarea
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              rows={4}
-              className="w-full resize-none rounded-xl border border-mm-border bg-mm-surface px-4 py-2.5 text-[14px] text-mm-text outline-none transition focus:border-mm-accent"
-            />
+            <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={4} className={`resize-none ${inputCls}`} />
           </Field>
 
-          <button
-            onClick={onSpawn}
-            disabled={!canSpawn}
-            className="nav-item-transition w-full rounded-xl bg-mm-accent px-4 py-2.5 text-[14px] font-medium text-white hover:bg-mm-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
-          >
+          <button onClick={onSpawn} disabled={!canSpawn} className="nav-item-transition w-full rounded-xl bg-mm-accent px-4 py-2.5 text-[14px] font-medium text-white hover:bg-mm-accent-hover disabled:cursor-not-allowed disabled:opacity-40">
             + Spawn Model Worker
           </button>
 

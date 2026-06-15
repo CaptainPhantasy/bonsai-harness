@@ -1,7 +1,7 @@
 import { join, normalize, isAbsolute } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
-export type ModelRuntimeKind = "local-command" | "openai-compatible";
+export type ModelRuntimeKind = "local-command" | "openai-compatible" | "anthropic";
 
 export const DEFAULT_PORT = 11431;
 export const DEFAULT_MAX_ACTIVE_AGENTS = 2;
@@ -17,6 +17,9 @@ export const DEFAULT_API_PATH = "/v1/chat/completions";
 export const DEFAULT_API_MAX_TOKENS = 256;
 export const DEFAULT_API_TEMPERATURE = 0.2;
 export const DEFAULT_RUNTIME_KIND: ModelRuntimeKind = "local-command";
+export const DEFAULT_ANTHROPIC_API_BASE_URL = "https://api.anthropic.com";
+export const DEFAULT_ANTHROPIC_API_MAX_TOKENS = 1024;
+export const DEFAULT_ANTHROPIC_API_TEMPERATURE = 0.7;
 
 export type LocalCommandRuntime = {
   kind: "local-command";
@@ -36,7 +39,15 @@ export type OpenAiCompatibleRuntime = {
   temperature: number;
 };
 
-export type ModelRuntime = LocalCommandRuntime | OpenAiCompatibleRuntime;
+export type AnthropicRuntime = {
+  kind: "anthropic";
+  modelId: string;
+  apiBaseUrl: string;
+  maxTokens: number;
+  temperature: number;
+};
+
+export type ModelRuntime = LocalCommandRuntime | OpenAiCompatibleRuntime | AnthropicRuntime;
 
 export type SpawnAgentMessage = {
   action: "spawn_agent";
@@ -55,9 +66,14 @@ export type WriteSandboxMessage = {
 export type SendMessage = {
   action: "send_message";
   payload: string;
+  attachments?: { name: string; size: number; type: string }[];
 };
 
-export type ClientMessage = SpawnAgentMessage | WriteSandboxMessage | SendMessage;
+export type StopGenerationMessage = {
+  action: "stop_generation";
+};
+
+export type ClientMessage = SpawnAgentMessage | WriteSandboxMessage | SendMessage | StopGenerationMessage;
 
 export type HarnessEvent =
   | { type: "status"; payload: string }
@@ -82,6 +98,10 @@ type HarnessEnv = NodeJS.ProcessEnv | {
   HARNESS_API_KEY?: string | undefined;
   HARNESS_API_MAX_TOKENS?: string | undefined;
   HARNESS_API_TEMPERATURE?: string | undefined;
+  ANTHROPIC_API_KEY?: string | undefined;
+  ANTHROPIC_API_BASE_URL?: string | undefined;
+  ANTHROPIC_API_MAX_TOKENS?: string | undefined;
+  ANTHROPIC_API_TEMPERATURE?: string | undefined;
 };
 
 export function resolvePort(env: HarnessEnv = process.env): number {
@@ -110,7 +130,7 @@ export function resolveRuntimeKind(env: HarnessEnv = process.env): ModelRuntimeK
 }
 
 export function isModelRuntimeKind(value: unknown): value is ModelRuntimeKind {
-  return value === "local-command" || value === "openai-compatible";
+  return value === "local-command" || value === "openai-compatible" || value === "anthropic";
 }
 
 export function resolveModelRuntime(
@@ -131,14 +151,29 @@ export function resolveModelRuntime(
     };
   }
 
+  if (kind === "anthropic") {
+    const anthropicBaseUrl = env.ANTHROPIC_API_BASE_URL?.trim().replace(/\/+$/, "") || DEFAULT_ANTHROPIC_API_BASE_URL;
+    const anthropicApiKey = env.ANTHROPIC_API_KEY?.trim();
+    if (!anthropicApiKey) throw new Error("ANTHROPIC_API_KEY is required for anthropic runtime");
+    const anthropicModelId = env.HARNESS_MODEL_ID?.trim() || modelId;
+    return {
+      kind,
+      modelId: anthropicModelId,
+      apiBaseUrl: anthropicBaseUrl,
+      maxTokens: resolveBoundedNumber(env.ANTHROPIC_API_MAX_TOKENS, DEFAULT_ANTHROPIC_API_MAX_TOKENS, "ANTHROPIC_API_MAX_TOKENS", 1, 128_000),
+      temperature: resolveBoundedNumber(env.ANTHROPIC_API_TEMPERATURE, DEFAULT_ANTHROPIC_API_TEMPERATURE, "ANTHROPIC_API_TEMPERATURE", 0, 2),
+    };
+  }
+
   const apiBaseUrl = env.HARNESS_API_BASE_URL?.trim().replace(/\/+$/, "");
   if (!apiBaseUrl) throw new Error("HARNESS_API_BASE_URL is required for openai-compatible runtime");
+  const apiModelId = env.HARNESS_MODEL_ID?.trim() || modelId;
   const apiKey = env.HARNESS_API_KEY?.trim();
   if (!apiKey) throw new Error("HARNESS_API_KEY is required for openai-compatible runtime");
 
   return {
     kind,
-    modelId,
+    modelId: apiModelId,
     apiBaseUrl,
     apiPath: normalizeApiPath(env.HARNESS_API_PATH?.trim() || DEFAULT_API_PATH),
     maxTokens: resolveBoundedNumber(env.HARNESS_API_MAX_TOKENS, DEFAULT_API_MAX_TOKENS, "HARNESS_API_MAX_TOKENS", 1, 128_000),
@@ -149,6 +184,12 @@ export function resolveModelRuntime(
 export function resolveApiKey(env: HarnessEnv = process.env): string {
   const apiKey = env.HARNESS_API_KEY?.trim();
   if (!apiKey) throw new Error("HARNESS_API_KEY is required for openai-compatible runtime");
+  return apiKey;
+}
+
+export function resolveAnthropicApiKey(env: HarnessEnv = process.env): string {
+  const apiKey = env.ANTHROPIC_API_KEY?.trim();
+  if (!apiKey) throw new Error("ANTHROPIC_API_KEY is required for anthropic runtime");
   return apiKey;
 }
 
@@ -214,6 +255,25 @@ export function buildOpenAiCompatibleRequest(runtime: OpenAiCompatibleRuntime, r
   };
 }
 
+export function buildAnthropicRequest(runtime: AnthropicRuntime, rolePrompt: string): {
+  url: string; body: Record<string, unknown>; headers: Record<string, string>;
+} {
+  return {
+    url: `${runtime.apiBaseUrl}/v1/messages`,
+    body: {
+      model: runtime.modelId,
+      max_tokens: runtime.maxTokens,
+      temperature: runtime.temperature,
+      messages: [{ role: "user", content: rolePrompt }],
+    },
+    headers: {
+      "x-api-key": "",
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+  };
+}
+
 export function createSandboxPath(filename: string, sandboxRoot: string): string {
   if (!filename || filename.trim().length === 0) throw new Error("filename must be non-empty");
   const normalized = normalize(filename).replace(/^\.\.(\/|\\|$)/, "");
@@ -247,7 +307,7 @@ export function parseClientMessage(message: string | Buffer): ClientMessage {
       throw new Error("spawn_agent modelId must be a string when provided");
     }
     if (parsed.runtimeKind !== undefined && !isModelRuntimeKind(parsed.runtimeKind)) {
-      throw new Error("spawn_agent runtimeKind must be one of: local-command, openai-compatible");
+      throw new Error("spawn_agent runtimeKind must be one of: local-command, openai-compatible, anthropic");
     }
     return {
       action: "spawn_agent",
@@ -276,10 +336,14 @@ export function parseClientMessage(message: string | Buffer): ClientMessage {
     if (typeof parsed.payload !== "string" || parsed.payload.trim().length === 0) {
       throw new Error("send_message requires a non-empty payload");
     }
-    return {
-      action: "send_message",
-      payload: parsed.payload,
-    };
+    const attachments = Array.isArray(parsed.attachments)
+      ? parsed.attachments.filter(isFileMetadata).map((a) => ({ name: String(a.name), size: Number(a.size), type: String(a.type) }))
+      : undefined;
+    return { action: "send_message", payload: parsed.payload, ...(attachments ? { attachments } : {}) };
+  }
+
+  if (parsed.action === "stop_generation") {
+    return { action: "stop_generation" };
   }
 
   throw new Error("Unsupported client action");
@@ -312,6 +376,15 @@ export function healthPayload(activeAgents: number, mcpConnections: number, env:
     };
   }
 
+  if (runtime.runtime.kind === "anthropic") {
+    return {
+      ...basePayload,
+      apiBaseUrl: runtime.runtime.apiBaseUrl,
+      apiMaxTokens: runtime.runtime.maxTokens,
+      apiTemperature: runtime.runtime.temperature,
+    };
+  }
+
   return {
     ...basePayload,
     apiBaseUrl: runtime.runtime.apiBaseUrl,
@@ -331,4 +404,114 @@ function safeResolveRuntime(env: HarnessEnv): { ok: boolean; runtime?: ModelRunt
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFileMetadata(value: unknown): value is { name: string; size: number; type: string } {
+  return isRecord(value) && typeof value.name === "string" && typeof value.size === "number" && typeof value.type === "string";
+}
+
+export type SettingsSnapshot = {
+  runtimeKind: ModelRuntimeKind;
+  modelId: string;
+  openai: {
+    apiBaseUrl: string;
+    apiPath: string;
+    maxTokens: number;
+    temperature: number;
+    apiKeySet: boolean;
+  };
+  anthropic: {
+    apiBaseUrl: string;
+    maxTokens: number;
+    temperature: number;
+    apiKeySet: boolean;
+  };
+};
+
+export function readSettingsSnapshot(env: HarnessEnv = process.env): SettingsSnapshot {
+  let runtimeKind: ModelRuntimeKind = DEFAULT_RUNTIME_KIND;
+  try { runtimeKind = resolveRuntimeKind(env); } catch { /* use default */ }
+  return {
+    runtimeKind,
+    modelId: resolveDefaultModelId(env),
+    openai: {
+      apiBaseUrl: env.HARNESS_API_BASE_URL?.trim().replace(/\/+$/, "") || DEFAULT_API_BASE_URL,
+      apiPath: normalizeApiPath(env.HARNESS_API_PATH?.trim() || DEFAULT_API_PATH),
+      maxTokens: resolveBoundedNumber(env.HARNESS_API_MAX_TOKENS, DEFAULT_API_MAX_TOKENS, "HARNESS_API_MAX_TOKENS", 1, 128_000),
+      temperature: resolveBoundedNumber(env.HARNESS_API_TEMPERATURE, DEFAULT_API_TEMPERATURE, "HARNESS_API_TEMPERATURE", 0, 2),
+      apiKeySet: !!(env.HARNESS_API_KEY?.trim()),
+    },
+    anthropic: {
+      apiBaseUrl: env.ANTHROPIC_API_BASE_URL?.trim().replace(/\/+$/, "") || DEFAULT_ANTHROPIC_API_BASE_URL,
+      maxTokens: resolveBoundedNumber(env.ANTHROPIC_API_MAX_TOKENS, DEFAULT_ANTHROPIC_API_MAX_TOKENS, "ANTHROPIC_API_MAX_TOKENS", 1, 128_000),
+      temperature: resolveBoundedNumber(env.ANTHROPIC_API_TEMPERATURE, DEFAULT_ANTHROPIC_API_TEMPERATURE, "ANTHROPIC_API_TEMPERATURE", 0, 2),
+      apiKeySet: !!(env.ANTHROPIC_API_KEY?.trim()),
+    },
+  };
+}
+
+export type SettingsUpdate = {
+  runtimeKind?: ModelRuntimeKind;
+  modelId?: string;
+  openai?: {
+    apiBaseUrl?: string;
+    apiPath?: string;
+    apiKey?: string;
+    maxTokens?: number;
+    temperature?: number;
+  };
+  anthropic?: {
+    apiBaseUrl?: string;
+    apiKey?: string;
+    maxTokens?: number;
+    temperature?: number;
+  };
+};
+
+function readEnvFile(path: string): Record<string, string> {
+  if (!existsSync(path)) return {};
+  const content = readFileSync(path, "utf-8");
+  const result: Record<string, string> = {};
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIndex = trimmed.indexOf("=");
+    if (eqIndex === -1) continue;
+    const key = trimmed.slice(0, eqIndex).trim();
+    const value = trimmed.slice(eqIndex + 1).trim();
+    result[key] = value;
+  }
+  return result;
+}
+
+function writeEnvFile(path: string, values: Record<string, string>): void {
+  const header = "# Bonsai Harness — Local Settings (managed by settings pane)\n# This file is gitignored. Do not commit.\n";
+  const lines = Object.entries(values).map(([k, v]) => `${k}=${v}`);
+  writeFileSync(path, header + lines.join("\n") + "\n", "utf-8");
+}
+
+export function applySettingsUpdate(update: SettingsUpdate): SettingsSnapshot {
+  const envFile = join(process.cwd(), ".env.local");
+  const existing = readEnvFile(envFile);
+
+  if (update.runtimeKind) { existing["HARNESS_RUNTIME_KIND"] = update.runtimeKind; process.env.HARNESS_RUNTIME_KIND = update.runtimeKind; }
+  if (update.modelId !== undefined) { existing["HARNESS_MODEL_ID"] = update.modelId; process.env.HARNESS_MODEL_ID = update.modelId; }
+
+  if (update.openai) {
+    if (update.openai.apiBaseUrl !== undefined) { existing["HARNESS_API_BASE_URL"] = update.openai.apiBaseUrl; process.env.HARNESS_API_BASE_URL = update.openai.apiBaseUrl; }
+    if (update.openai.apiPath !== undefined) { existing["HARNESS_API_PATH"] = update.openai.apiPath; process.env.HARNESS_API_PATH = update.openai.apiPath; }
+    if (update.openai.apiKey) { existing["HARNESS_API_KEY"] = update.openai.apiKey; process.env.HARNESS_API_KEY = update.openai.apiKey; }
+    if (update.openai.maxTokens !== undefined) { existing["HARNESS_API_MAX_TOKENS"] = String(update.openai.maxTokens); process.env.HARNESS_API_MAX_TOKENS = String(update.openai.maxTokens); }
+    if (update.openai.temperature !== undefined) { existing["HARNESS_API_TEMPERATURE"] = String(update.openai.temperature); process.env.HARNESS_API_TEMPERATURE = String(update.openai.temperature); }
+  }
+
+  if (update.anthropic) {
+    if (update.anthropic.apiBaseUrl !== undefined) { existing["ANTHROPIC_API_BASE_URL"] = update.anthropic.apiBaseUrl; process.env.ANTHROPIC_API_BASE_URL = update.anthropic.apiBaseUrl; }
+    if (update.anthropic.apiKey) { existing["ANTHROPIC_API_KEY"] = update.anthropic.apiKey; process.env.ANTHROPIC_API_KEY = update.anthropic.apiKey; }
+    if (update.anthropic.maxTokens !== undefined) { existing["ANTHROPIC_API_MAX_TOKENS"] = String(update.anthropic.maxTokens); process.env.ANTHROPIC_API_MAX_TOKENS = String(update.anthropic.maxTokens); }
+    if (update.anthropic.temperature !== undefined) { existing["ANTHROPIC_API_TEMPERATURE"] = String(update.anthropic.temperature); process.env.ANTHROPIC_API_TEMPERATURE = String(update.anthropic.temperature); }
+  }
+
+  writeEnvFile(envFile, existing);
+  return readSettingsSnapshot(process.env);
 }

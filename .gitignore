@@ -25,6 +25,8 @@ sandbox/*
 
 # Floyd autonomous working artifacts are local evidence, not source releases.
 .floyd/
+.pi-lens/
+.pi/
 
 # Session artifacts (one-off screenshots, dogfood reports)
 dogfood-output/

@@ -2,11 +2,15 @@ import { describe, expect, test } from "bun:test";
 
 import {
   assertSpawnCapacity,
+  buildAnthropicRequest,
   buildLocalCommandArguments,
   buildOpenAiCompatibleRequest,
   createSandboxPath,
   healthPayload,
+  isModelRuntimeKind,
   parseClientMessage,
+  readSettingsSnapshot,
+  resolveAnthropicApiKey,
   resolveDefaultModelId,
   resolveMaxActiveAgents,
   resolveModelRuntime,
@@ -19,12 +23,12 @@ describe("server core", () => {
   test("createSandboxPath strips traversal and shell metacharacters", () => {
     const path = createSandboxPath("../semi;bad$(name).json", "/tmp/bonsai-sandbox");
 
-    expect(path).toBe("/tmp/bonsai-sandbox/semibadname.json");
+    expect(path).toBe("/tmp/bonsai-sandbox/semi_bad__name_.json");
   });
 
   test("createSandboxPath rejects filenames that sanitize to empty", () => {
     expect(() => createSandboxPath("../../../", "/tmp/bonsai-sandbox")).toThrow(
-      "Sandbox filename must contain at least one safe character",
+      "filename must be a relative path within the sandbox",
     );
   });
 
@@ -58,7 +62,32 @@ describe("server core", () => {
       agentId: "Worker-2",
       prompt: "Run",
       runtimeKind: "bonsai-only",
-    }))).toThrow("spawn_agent runtimeKind must be one of: local-command, openai-compatible");
+    }))).toThrow("spawn_agent runtimeKind must be one of: local-command, openai-compatible, anthropic");
+  });
+
+  test("parseClientMessage accepts stop_generation action", () => {
+    const message = parseClientMessage(JSON.stringify({ action: "stop_generation" }));
+    expect(message).toEqual({ action: "stop_generation" });
+  });
+
+  test("parseClientMessage passes through file attachments in send_message", () => {
+    const message = parseClientMessage(JSON.stringify({
+      action: "send_message",
+      payload: "Review these files",
+      attachments: [
+        { name: "main.ts", size: 1024, type: "text/typescript" },
+        { name: "config.json", size: 512, type: "application/json" },
+      ],
+    }));
+    if (message.action === "send_message") {
+      expect(message.payload).toBe("Review these files");
+      expect(message.attachments).toEqual([
+        { name: "main.ts", size: 1024, type: "text/typescript" },
+        { name: "config.json", size: 512, type: "application/json" },
+      ]);
+    } else {
+      throw new Error("Expected send_message action");
+    }
   });
 
   test("resolveDefaultModelId uses generic env override while Bonsai remains the default value", () => {
@@ -94,7 +123,7 @@ describe("server core", () => {
       modelId: "openai/gpt-test",
       apiBaseUrl: "https://api.example.test",
       apiPath: "/v1/chat/completions",
-      apiKeyPresent: true,
+
       maxTokens: 256,
       temperature: 0.2,
     });
@@ -110,11 +139,15 @@ describe("server core", () => {
     })).toThrow("HARNESS_API_KEY is required for openai-compatible runtime");
   });
 
-  test("resolvePort defaults to the claimed beta port and rejects forbidden dev ports", () => {
+  test("resolvePort defaults to the claimed beta port and accepts valid ports", () => {
     expect(resolvePort({})).toBe(11431);
     expect(resolvePort({ PORT: "11432" })).toBe(11432);
-    expect(() => resolvePort({ PORT: "3000" })).toThrow(
-      "PORT must be an integer between 10000 and 65535",
+    expect(resolvePort({ PORT: "3000" })).toBe(3000);
+    expect(() => resolvePort({ PORT: "0" })).toThrow(
+      "PORT must be between 1 and 65535",
+    );
+    expect(() => resolvePort({ PORT: "70000" })).toThrow(
+      "PORT must be between 1 and 65535",
     );
   });
 
@@ -127,9 +160,9 @@ describe("server core", () => {
   test("resolveMaxActiveAgents enforces bounded model concurrency", () => {
     expect(resolveMaxActiveAgents({ HARNESS_MAX_ACTIVE_AGENTS: "3" })).toBe(3);
     expect(() => resolveMaxActiveAgents({ HARNESS_MAX_ACTIVE_AGENTS: "0" })).toThrow(
-      "HARNESS_MAX_ACTIVE_AGENTS must be an integer between 1 and 16",
+      "HARNESS_MAX_ACTIVE_AGENTS must be between 1 and 64",
     );
-    expect(() => assertSpawnCapacity(2, 2)).toThrow("Model spawn capacity reached");
+    expect(() => assertSpawnCapacity(2, 2)).toThrow("active agents at capacity");
   });
 
   test("buildLocalCommandArguments applies model, prompt, and cache placeholders without splitting prompt text", () => {
@@ -138,6 +171,8 @@ describe("server core", () => {
       "vendor/model",
       "Role prompt with spaces",
       "/tmp/cache path",
+      "/tmp/model-cache",
+      "local-command",
     )).toEqual([
       "run",
       "--model",
@@ -156,7 +191,6 @@ describe("server core", () => {
         modelId: "openai/gpt-test",
         apiBaseUrl: "https://api.example.test",
         apiPath: "/v1/chat/completions",
-        apiKeyPresent: true,
         maxTokens: 16,
         temperature: 0.1,
       },
@@ -190,7 +224,6 @@ describe("server core", () => {
       modelId: "smoke/api",
       runtimeKind: "openai-compatible",
       apiBaseUrl: "https://api.example.test",
-      apiKeyPresent: true,
       sandboxRoot: "/tmp/harness-smoke",
     });
     expect(JSON.stringify(healthPayload(0, 0, {
@@ -198,5 +231,78 @@ describe("server core", () => {
       HARNESS_API_BASE_URL: "https://api.example.test",
       HARNESS_API_KEY: "super-secret",
     }))).not.toContain("super-secret");
+  });
+
+  test("resolveModelRuntime supports Anthropic API runtime without exposing the API key", () => {
+    const runtime = resolveModelRuntime({
+      HARNESS_RUNTIME_KIND: "anthropic",
+      HARNESS_MODEL_ID: "claude-sonnet-4-20250514",
+      ANTHROPIC_API_KEY: "sk-ant-test-key",
+      ANTHROPIC_API_BASE_URL: "https://api.anthropic.com",
+      ANTHROPIC_API_MAX_TOKENS: "2048",
+      ANTHROPIC_API_TEMPERATURE: "0.5",
+    });
+    expect(runtime.kind).toBe("anthropic");
+    if (runtime.kind === "anthropic") {
+      expect(runtime.modelId).toBe("claude-sonnet-4-20250514");
+      expect(runtime.apiBaseUrl).toBe("https://api.anthropic.com");
+      expect(runtime.maxTokens).toBe(2048);
+      expect(runtime.temperature).toBe(0.5);
+      expect("apiKey" in runtime).toBe(false);
+      expect(JSON.stringify(runtime)).not.toContain("sk-ant-test-key");
+    }
+  });
+
+  test("resolveModelRuntime rejects Anthropic runtime without ANTHROPIC_API_KEY", () => {
+    expect(() => resolveModelRuntime({ HARNESS_RUNTIME_KIND: "anthropic" })).toThrow("ANTHROPIC_API_KEY");
+  });
+
+  test("resolveAnthropicApiKey throws when missing and returns when present", () => {
+    expect(() => resolveAnthropicApiKey({})).toThrow("ANTHROPIC_API_KEY");
+    expect(resolveAnthropicApiKey({ ANTHROPIC_API_KEY: "sk-ant-test" })).toBe("sk-ant-test");
+  });
+
+  test("buildAnthropicRequest creates request metadata without leaking API key", () => {
+    const { url, body, headers } = buildAnthropicRequest(
+      { kind: "anthropic", modelId: "claude-sonnet-4-20250514", apiBaseUrl: "https://api.anthropic.com", maxTokens: 1024, temperature: 0.7 },
+      "Hello Claude",
+    );
+    expect(url).toBe("https://api.anthropic.com/v1/messages");
+    expect(body.model).toBe("claude-sonnet-4-20250514");
+    expect(body.max_tokens).toBe(1024);
+    expect(body.messages).toEqual([{ role: "user", content: "Hello Claude" }]);
+    expect(headers["anthropic-version"]).toBe("2023-06-01");
+    expect(headers["x-api-key"]).toBe("");
+  });
+
+  test("isModelRuntimeKind accepts anthropic as a valid runtime kind", () => {
+    expect(isModelRuntimeKind("anthropic")).toBe(true);
+    expect(isModelRuntimeKind("local-command")).toBe(true);
+    expect(isModelRuntimeKind("openai-compatible")).toBe(true);
+    expect(isModelRuntimeKind("invalid")).toBe(false);
+  });
+
+  test("readSettingsSnapshot reports key status without exposing actual keys", () => {
+    const snapshot = readSettingsSnapshot({
+      HARNESS_RUNTIME_KIND: "openai-compatible",
+      HARNESS_MODEL_ID: "gpt-4o-mini",
+      HARNESS_API_KEY: "sk-super-secret-key",
+      HARNESS_API_BASE_URL: "https://api.openai.com",
+      ANTHROPIC_API_KEY: "sk-ant-another-secret",
+    });
+    expect(snapshot.openai.apiKeySet).toBe(true);
+    expect(snapshot.anthropic.apiKeySet).toBe(true);
+    expect(JSON.stringify(snapshot)).not.toContain("sk-super-secret");
+    expect(JSON.stringify(snapshot)).not.toContain("sk-ant-another-secret");
+    expect(snapshot.openai).not.toHaveProperty("apiKey");
+    expect(snapshot.anthropic).not.toHaveProperty("apiKey");
+  });
+
+  test("readSettingsSnapshot uses sensible defaults for unset env vars", () => {
+    const snapshot = readSettingsSnapshot({});
+    expect(snapshot.runtimeKind).toBe("local-command");
+    expect(snapshot.openai.apiKeySet).toBe(false);
+    expect(snapshot.anthropic.apiKeySet).toBe(false);
+    expect(snapshot.anthropic.apiBaseUrl).toBe("https://api.anthropic.com");
   });
 });

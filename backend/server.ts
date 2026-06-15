@@ -5,16 +5,21 @@ import { mkdir } from "node:fs/promises";
 import {
   assertExecutableExists,
   assertSpawnCapacity,
+  buildAnthropicRequest,
   buildLocalCommandArguments,
   buildOpenAiCompatibleRequest,
   createSandboxPath,
   healthPayload,
   parseClientMessage,
+  applySettingsUpdate,
+  readSettingsSnapshot,
+  resolveAnthropicApiKey,
   resolveApiKey,
   resolveMaxActiveAgents,
   resolveModelRuntime,
   resolvePort,
   resolveSandboxRoot,
+  type AnthropicRuntime,
   type HarnessEvent,
   type OpenAiCompatibleRuntime,
 } from "./src/server-core";
@@ -35,7 +40,7 @@ await mkdir("/Volumes/SanDisk1Tb/bonsai-harness/logs", { recursive: true });
 function spawnHarnessAgent(
   agentId: string,
   rolePrompt: string,
-  requested: { modelId?: string | undefined; runtimeKind?: "local-command" | "openai-compatible" | undefined } = {},
+  requested: { modelId?: string | undefined; runtimeKind?: "local-command" | "openai-compatible" | "anthropic" | undefined } = {},
 ) {
   if (activeAgents.has(agentId)) {
     throw new Error(`Agent ${agentId} is already active`);
@@ -90,6 +95,16 @@ function spawnHarnessAgent(
     return;
   }
 
+  if (runtime.kind === "anthropic") {
+    console.log(`[HARNESS] Spawning ${agentId} with ${runtime.modelId} via anthropic:${runtime.apiBaseUrl}`);
+    const anthropicController = new AbortController();
+    const anthropicTimeoutId = setTimeout(() => anthropicController.abort(), 60_000);
+    activeAgents.set(agentId, { stop: () => { clearTimeout(anthropicTimeoutId); anthropicController.abort(); } });
+    broadcast({ type: "status", payload: `Spawned ${agentId} (anthropic:${runtime.modelId})` });
+    void runAnthropicAgent(agentId, rolePrompt, runtime, anthropicController, anthropicTimeoutId);
+    return;
+  }
+
   console.log(`[HARNESS] Spawning ${agentId} with ${runtime.modelId} via ${runtime.kind}:${runtime.apiBaseUrl}`);
   const controller = new AbortController();
   const API_TIMEOUT_MS = 60_000;
@@ -137,6 +152,41 @@ async function runOpenAiCompatibleAgent(
   }
 }
 
+async function runAnthropicAgent(
+  agentId: string,
+  rolePrompt: string,
+  runtime: AnthropicRuntime,
+  controller: AbortController,
+  timeoutId: ReturnType<typeof setTimeout>,
+) {
+  let exitCode = 0;
+  try {
+    const { url, body, headers } = buildAnthropicRequest(runtime, rolePrompt);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { ...headers, "x-api-key": resolveAnthropicApiKey(process.env) },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(`Anthropic API failed with HTTP ${response.status}: ${responseText}`);
+    }
+    const responseJson = JSON.parse(responseText) as unknown;
+    broadcast({ type: "inference", agentId, payload: extractAnthropicContent(responseJson) });
+  } catch (error) {
+    exitCode = 1;
+    const payload = error instanceof Error && error.name === "AbortError"
+      ? "Anthropic API runtime aborted"
+      : error instanceof Error ? error.message : String(error);
+    broadcast({ type: "error", agentId, payload });
+  } finally {
+    clearTimeout(timeoutId);
+    activeAgents.delete(agentId);
+    broadcast({ type: "agent_exit", agentId, code: exitCode, signal: null });
+  }
+}
+
 function connectLocalMCPServer(serverName: string, startCommand: string[]) {
   if (startCommand.length === 0 || !startCommand[0]) {
     throw new Error("MCP start command must include an executable");
@@ -170,7 +220,7 @@ async function writeToSandbox(filename: string, content: string) {
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
@@ -181,7 +231,7 @@ function cors(response: Response): Response {
 
 serve({
   port: PORT,
-  fetch(req, server) {
+  async fetch(req, server) {
     const url = new URL(req.url);
 
     if (req.method === "OPTIONS") {
@@ -195,6 +245,21 @@ serve({
     if (url.pathname === "/mcp/local-fs" && req.method === "POST") {
       connectLocalMCPServer("Local-FS-Server", ["/usr/bin/env", "bash", "-lc", "pwd"]);
       return cors(Response.json({ ok: true }));
+    }
+
+    if (url.pathname === "/api/settings" && req.method === "GET") {
+      return cors(Response.json(readSettingsSnapshot(process.env)));
+    }
+
+    if (url.pathname === "/api/settings" && req.method === "PUT") {
+      try {
+        const body = await req.json();
+        const snapshot = applySettingsUpdate(body);
+        return cors(Response.json(snapshot));
+      } catch (error) {
+        const payload = error instanceof Error ? error.message : String(error);
+        return cors(Response.json({ error: payload }, { status: 400 }));
+      }
     }
 
     if (server.upgrade(req, { headers: CORS_HEADERS })) return undefined;
@@ -215,7 +280,21 @@ serve({
 
         if (req.action === "send_message") {
           const chatId = `Chat-${Date.now().toString(36)}`;
-          spawnHarnessAgent(chatId, req.payload);
+          let prompt = req.payload;
+          if (req.attachments && req.attachments.length > 0) {
+            const fileList = req.attachments.map((a) => `- ${a.name} (${a.type}, ${a.size} bytes)`).join("\n");
+            prompt = `${req.payload}\n\nAttached files:\n${fileList}`;
+          }
+          spawnHarnessAgent(chatId, prompt);
+          return;
+        }
+
+        if (req.action === "stop_generation") {
+          const stopped = activeAgents.size;
+          for (const [agentId, agent] of activeAgents) {
+            agent.stop();
+          }
+          broadcast({ type: "status", payload: `Stopped ${stopped} active agent${stopped === 1 ? "" : "s"}` });
           return;
         }
 
@@ -249,6 +328,18 @@ function extractOpenAiCompatibleContent(value: unknown): string {
       }
       if (typeof choices[0].text === "string") {
         return choices[0].text;
+      }
+    }
+  }
+  return JSON.stringify(value);
+}
+
+function extractAnthropicContent(value: unknown): string {
+  if (isRecord(value)) {
+    const content = value.content;
+    if (Array.isArray(content) && content.length > 0 && isRecord(content[0])) {
+      if (typeof content[0].text === "string") {
+        return content[0].text;
       }
     }
   }
