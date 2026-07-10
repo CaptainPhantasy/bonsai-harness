@@ -40,8 +40,10 @@ jobs:
         working-directory: frontend
         run: bun run lint
 
+      - name: Test frontend API boundary
+        working-directory: frontend
+        run: bun test
+
       - name: Build frontend
         working-directory: frontend
-        env:
-          VITE_HARNESS_BACKEND_URL: http://localhost:11431
         run: bun run build

@@ -10,16 +10,19 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { toast } from 'sonner'
 import { useLocalStorage, useSystemTheme, useScrollPosition } from './hooks/useLocalStorage'
+import { apiFetch, resolveHarnessWebSocketUrl } from './api'
 
 /* ── Types ── */
 type Agent = { id: string; status: 'idle' | 'active' | 'exited' | 'error'; modelId?: string; runtimeKind?: RuntimeKind }
-type RuntimeKind = 'local-command' | 'openai-compatible' | 'anthropic'
+type RuntimeKind = 'openai-compatible' | 'anthropic'
+type SafetyMode = 'plan' | 'ask' | 'auto' | 'yolo'
 type HarnessEvent =
   | { type: 'status'; payload: string }
   | { type: 'error'; payload: string; agentId?: string }
   | { type: 'inference'; agentId: string; payload: string }
   | { type: 'agent_exit'; agentId: string; code: number | null; signal: string | null }
   | { type: 'mcp_response'; server: string; payload: string }
+  | { type: 'tool_approval_required'; requestId: string; agentId: string; server: string; tool: string; arguments: Record<string, unknown> }
   | { type: 'sandbox_write'; path: string; payload: string }
 
 type ChatMessage = {
@@ -47,22 +50,40 @@ type ProviderSettings = {
   anthropic: { apiBaseUrl: string; apiKey: string; maxTokens: string; temperature: string; apiKeySet: boolean }
 }
 
+type McpServer = {
+  name: string
+  displayName: string
+  description: string
+  transport: string
+  version: string
+  toolCount: number
+  source: string
+  available: boolean
+  unavailableReason?: string
+  connected: boolean
+}
+
+type PendingToolApproval = {
+  requestId: string
+  agentId: string
+  server: string
+  tool: string
+  arguments: Record<string, unknown>
+}
+
 /* ── Constants ── */
 const RECONNECT_BASE_MS = 1_000
 const RECONNECT_MAX_MS = 30_000
 const HEALTH_POLL_MS = 5_000
 const MAX_LOGS = 250
 const MAX_INPUT_CHARS = 8_000
-const DEFAULT_BACKEND_URL = 'http://localhost:11431'
-const DEFAULT_MODEL_ID = 'prism-ml/Ternary-Bonsai-8B-mlx-2bit'
+const DEFAULT_MODEL_ID = 'gpt-4o-mini'
 const DEFAULT_PROMPT = 'You are a deterministic code generation agent optimized for concise inference.'
 const ASSET_BASE = import.meta.env.BASE_URL
 
 const PRESET_MODELS = [
-  { id: 'prism-ml/Ternary-Bonsai-8B-mlx-2bit', label: 'Ternary Bonsai 8B', description: '2-bit MLX, low memory' },
-  { id: 'mlx-community/Llama-3.2-3B-Instruct-4bit', label: 'Llama 3.2 3B', description: 'Fast inference, instruct-tuned' },
-  { id: 'mlx-community/Qwen2.5-Coder-7B-Instruct-4bit', label: 'Qwen2.5 Coder 7B', description: 'Code-specialized' },
-  { id: 'mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit', label: 'DeepSeek R1 7B', description: 'Reasoning-focused' },
+  { id: 'gpt-4o-mini', label: 'GPT-4o mini', description: 'OpenAI-compatible default' },
+  { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet', description: 'Anthropic Messages API' },
 ] as const
 
 const SUGGESTED_PROMPTS = [
@@ -80,15 +101,6 @@ function generateId() {
 function appendBoundedLog(lines: string[], line: string) {
   const next = [...lines, line]
   return next.length > MAX_LOGS ? next.slice(next.length - MAX_LOGS) : next
-}
-
-function resolveBackendWebSocketUrl(rawBackendUrl: string | undefined) {
-  const raw = rawBackendUrl?.trim() || DEFAULT_BACKEND_URL
-  const url = new URL(raw)
-  if (url.protocol === 'http:') url.protocol = 'ws:'
-  else if (url.protocol === 'https:') url.protocol = 'wss:'
-  else if (url.protocol !== 'ws:' && url.protocol !== 'wss:') throw new Error(`Unsupported protocol: ${url.protocol}`)
-  return url.toString().replace(/\/$/, '')
 }
 
 function formatTimestamp(timestamp: number): string {
@@ -458,8 +470,9 @@ export default function HarnessDashboard() {
   const [logs, setLogs] = useState<string[]>(['[SYSTEM] Dashboard initialized'])
   const [agents, setAgents] = useState<Agent[]>([{ id: 'CodeGen-01', status: 'idle' }])
   const [connected, setConnected] = useState(false)
-  const [modelId, setModelId] = useLocalStorage<string>('bonsai-model-id', DEFAULT_MODEL_ID)
-  const [runtimeKind, setRuntimeKind] = useLocalStorage<RuntimeKind>('bonsai-runtime-kind', 'local-command')
+  const [modelId, setModelId] = useLocalStorage<string>('harness-model-id', DEFAULT_MODEL_ID)
+  const [runtimeKind, setRuntimeKind] = useLocalStorage<RuntimeKind>('harness-runtime-kind', 'openai-compatible')
+  const [safetyMode, setSafetyMode] = useLocalStorage<SafetyMode>('harness-safety-mode', 'ask')
   const [prompt, setPrompt] = useLocalStorage<string>('bonsai-system-prompt', DEFAULT_PROMPT)
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
   const [inputMessage, setInputMessage] = useState('')
@@ -484,7 +497,8 @@ export default function HarnessDashboard() {
   const [providerSettings, setProviderSettings] = useState<ProviderSettings | null>(null)
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [settingsLoaded, setSettingsLoaded] = useState(false)
-  const [mcpConnected, setMcpConnected] = useState(false)
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([])
+  const [pendingToolApprovals, setPendingToolApprovals] = useState<PendingToolApproval[]>([])
   const systemTheme = useSystemTheme()
   const effectiveLight = isLight || (theme !== 'bonsai' && systemTheme === 'light')
 
@@ -497,8 +511,7 @@ export default function HarnessDashboard() {
   const dropZoneRef = useRef<HTMLDivElement>(null)
   const isScrolledUp = useScrollPosition(chatContainerRef)
 
-  const backendWsUrl = useMemo(() => resolveBackendWebSocketUrl(import.meta.env.VITE_HARNESS_BACKEND_URL), [])
-  const backendHttpUrl = useMemo(() => import.meta.env.VITE_HARNESS_BACKEND_URL?.trim() || DEFAULT_BACKEND_URL, [])
+  const backendWsUrl = useMemo(() => resolveHarnessWebSocketUrl(), [])
 
   /* ── Formatters ── */
   const formatEvent = useCallback((event: HarnessEvent) => {
@@ -506,6 +519,7 @@ export default function HarnessDashboard() {
       case 'inference': return `[${event.agentId}] ${event.payload}`
       case 'agent_exit': return `[${event.agentId}] exited code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`
       case 'mcp_response': return `[MCP:${event.server}] ${event.payload}`
+      case 'tool_approval_required': return `[APPROVAL:${event.agentId}] ${event.server}.${event.tool} requires approval`
       case 'sandbox_write': return `[SANDBOX] ${event.payload}`
       case 'error': return `[ERROR${event.agentId ? `:${event.agentId}` : ''}] ${event.payload}`
       case 'status': return `[SYSTEM] ${event.payload}`
@@ -550,6 +564,15 @@ export default function HarnessDashboard() {
           }
           toast.error(data.payload)
         }
+        if (data.type === 'tool_approval_required') {
+          setPendingToolApprovals((previous) => [...previous, {
+            requestId: data.requestId,
+            agentId: data.agentId,
+            server: data.server,
+            tool: data.tool,
+            arguments: data.arguments,
+          }])
+        }
         setLogs((prev) => appendBoundedLog(prev, formatEvent(data)))
       }
       ws.onclose = () => {
@@ -572,7 +595,7 @@ export default function HarnessDashboard() {
     let disposed = false
     function poll() {
       if (disposed) return
-      fetch(`${backendHttpUrl}/health`)
+      apiFetch('/health')
         .then((r) => r.ok ? r.json() : null)
         .then((data) => { if (!disposed && data) setHealth(data as Record<string, unknown>) })
         .catch(() => { if (!disposed) setHealth(null) })
@@ -580,12 +603,12 @@ export default function HarnessDashboard() {
     poll()
     const id = setInterval(poll, HEALTH_POLL_MS)
     return () => { disposed = true; clearInterval(id) }
-  }, [backendHttpUrl])
+  }, [])
 
   /* ── Provider Settings Fetch ── */
   useEffect(() => {
     if (sidebarView !== 'settings' || settingsLoaded) return
-    fetch(`${backendHttpUrl}/api/settings`)
+    apiFetch('/api/settings')
       .then((r) => r.ok ? r.json() : null)
       .then((data) => {
         if (!data) return
@@ -610,7 +633,21 @@ export default function HarnessDashboard() {
         setSettingsLoaded(true)
       })
       .catch(() => {})
-  }, [sidebarView, settingsLoaded, backendHttpUrl])
+  }, [sidebarView, settingsLoaded])
+
+  /* ── MCP Server Inventory ── */
+  const loadMcpServers = useCallback(async () => {
+    try {
+      const response = await apiFetch('/api/mcp/servers')
+      if (!response.ok) throw new Error(`MCP inventory failed: HTTP ${response.status}`)
+      const servers = await response.json() as McpServer[]
+      setMcpServers(servers)
+    } catch (error) {
+      setLogs((previous) => appendBoundedLog(previous, `[MCP] ${error instanceof Error ? error.message : 'Could not load server inventory'}`))
+    }
+  }, [])
+
+  useEffect(() => { void loadMcpServers() }, [loadMcpServers])
 
   /* ── Auto-scroll with user override ── */
   useEffect(() => {
@@ -648,9 +685,10 @@ export default function HarnessDashboard() {
     setAgents((prev) => [...prev, { id: nextId, status: 'active', modelId: trimmedModelId, runtimeKind }])
     socketRef.current?.send(JSON.stringify({
       action: 'spawn_agent', agentId: nextId, prompt: trimmedPrompt, modelId: trimmedModelId, runtimeKind,
+      safetyMode,
     }))
     toast.success(`Spawned ${nextId}`)
-  }, [agents.length, modelId, prompt, runtimeKind])
+  }, [agents.length, modelId, prompt, runtimeKind, safetyMode])
 
   const handleSend = useCallback(() => {
     const trimmed = inputMessage.trim()
@@ -672,10 +710,11 @@ export default function HarnessDashboard() {
       action: 'send_message',
       payload: trimmed,
       attachments: pendingFiles.map((f) => ({ name: f.name, size: f.size, type: f.type })),
+      safetyMode,
     }))
     setInputMessage('')
     setPendingFiles([])
-  }, [inputMessage, connected, isStreaming, pendingFiles])
+  }, [inputMessage, connected, isStreaming, pendingFiles, safetyMode])
 
   const stopGeneration = useCallback(() => {
     if (!isStreaming) return
@@ -718,7 +757,7 @@ export default function HarnessDashboard() {
       if (providerSettings.openai.apiKey) (body.openai as Record<string, unknown>).apiKey = providerSettings.openai.apiKey
       if (providerSettings.anthropic.apiKey) (body.anthropic as Record<string, unknown>).apiKey = providerSettings.anthropic.apiKey
 
-      const res = await fetch(`${backendHttpUrl}/api/settings`, {
+      const res = await apiFetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -738,17 +777,34 @@ export default function HarnessDashboard() {
     } finally {
       setSettingsSaving(false)
     }
-  }, [providerSettings, modelId, backendHttpUrl, setRuntimeKind])
+  }, [providerSettings, modelId, setRuntimeKind])
 
-  const connectMCP = useCallback(() => {
-    fetch(`${backendHttpUrl}/mcp/local-fs`, { method: 'POST' })
-      .then((r) => r.ok ? r.json() : null)
-      .then((data) => {
-        if (data?.ok) { setMcpConnected(true); toast.success('MCP Local-FS-Server connected') }
-        else toast.error('Failed to connect MCP server')
-      })
-      .catch(() => toast.error('Failed to connect MCP server'))
-  }, [backendHttpUrl])
+  const connectMcpServer = useCallback(async (server: McpServer) => {
+    try {
+      const response = await apiFetch(`/api/mcp/servers/${encodeURIComponent(server.name)}/connect`, { method: 'POST' })
+      if (!response.ok) throw new Error(`Connect failed: HTTP ${response.status}`)
+      await loadMcpServers()
+      toast.success(`${server.displayName} connected`)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : `Could not connect ${server.displayName}`)
+    }
+  }, [loadMcpServers])
+
+  const disconnectMcpServer = useCallback(async (server: McpServer) => {
+    try {
+      const response = await apiFetch(`/api/mcp/servers/${encodeURIComponent(server.name)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(`Disconnect failed: HTTP ${response.status}`)
+      await loadMcpServers()
+      toast.success(`${server.displayName} disconnected`)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : `Could not disconnect ${server.displayName}`)
+    }
+  }, [loadMcpServers])
+
+  const resolvePendingToolApproval = useCallback((approval: PendingToolApproval, approved: boolean) => {
+    socketRef.current?.send(JSON.stringify({ action: 'resolve_tool_approval', requestId: approval.requestId, approved }))
+    setPendingToolApprovals((previous) => previous.filter((item) => item.requestId !== approval.requestId))
+  }, [])
 
   /* ── Message Actions ── */
   const copyMessage = useCallback(async (content: string) => {
@@ -1070,15 +1126,38 @@ export default function HarnessDashboard() {
               </div>
             ))}
 
-            <SectionHeader label="MCP Bus" />
-            <button
-              onClick={connectMCP}
-              className="nav-item-transition flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] text-mm-text-secondary hover:bg-mm-surface-hover"
-              title={mcpConnected ? 'Local-FS-Server connected' : 'Click to connect Local-FS-Server'}
-            >
-              <FolderOpen size={16} /> Local-FS-Server
-              {mcpConnected && <Circle size={6} className="ml-auto shrink-0 fill-mm-green text-mm-green" />}
-            </button>
+            <SectionHeader label="MCP Servers" />
+            {mcpServers.length === 0 ? (
+              <p className="px-3 text-[12px] text-mm-text-tertiary">Loading MCP inventory…</p>
+            ) : mcpServers.map((server) => (
+              <button
+                key={server.name}
+                onClick={() => server.connected ? void disconnectMcpServer(server) : void connectMcpServer(server)}
+                disabled={!server.available}
+                className="nav-item-transition mb-0.5 flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13px] text-mm-text-secondary hover:bg-mm-surface-hover disabled:cursor-not-allowed disabled:opacity-45"
+                title={server.available ? `${server.description} (${server.toolCount} advertised tools)` : server.unavailableReason ?? 'Unavailable'}
+              >
+                <FolderOpen size={16} />
+                <span className="min-w-0 flex-1 truncate">{server.displayName}</span>
+                {server.connected ? <Circle size={6} className="shrink-0 fill-mm-green text-mm-green" /> : !server.available && <span className="text-[10px]">Unavailable</span>}
+              </button>
+            ))}
+
+            {pendingToolApprovals.length > 0 && (
+              <>
+                <SectionHeader label="Tool Approvals" />
+                {pendingToolApprovals.map((approval) => (
+                  <div key={approval.requestId} className="mb-2 rounded-lg border border-mm-border bg-mm-surface p-2.5 text-[11px] text-mm-text-secondary">
+                    <div className="truncate font-medium text-mm-text">{approval.server}.{approval.tool}</div>
+                    <div className="mt-1 truncate">{JSON.stringify(approval.arguments)}</div>
+                    <div className="mt-2 flex gap-2">
+                      <button onClick={() => resolvePendingToolApproval(approval, true)} className="rounded bg-mm-green/20 px-2 py-1 text-mm-green hover:bg-mm-green/30">Approve</button>
+                      <button onClick={() => resolvePendingToolApproval(approval, false)} className="rounded bg-mm-red/20 px-2 py-1 text-mm-red hover:bg-mm-red/30">Reject</button>
+                    </div>
+                  </div>
+                ))}
+              </>
+            )}
 
             <div className="mt-4">
               <button
@@ -1156,6 +1235,7 @@ export default function HarnessDashboard() {
           <SettingsPanel
             modelId={modelId} setModelId={setModelId}
             runtimeKind={runtimeKind} setRuntimeKind={setRuntimeKind}
+            safetyMode={safetyMode} setSafetyMode={setSafetyMode}
             prompt={prompt} setPrompt={setPrompt}
             health={health} activeCount={activeCount} canSpawn={canSpawn} onSpawn={spawnAgent}
             onBack={() => { setSidebarView('agents'); setSettingsLoaded(false) }}
@@ -1454,12 +1534,13 @@ export default function HarnessDashboard() {
 
 /* ── Settings Panel ── */
 function SettingsPanel({
-  modelId, setModelId, runtimeKind, setRuntimeKind, prompt, setPrompt,
+  modelId, setModelId, runtimeKind, setRuntimeKind, safetyMode, setSafetyMode, prompt, setPrompt,
   health, activeCount, canSpawn, onSpawn, onBack,
   providerSettings, setProviderSettings, settingsSaving, onSaveSettings,
 }: {
   modelId: string; setModelId: (v: string) => void
   runtimeKind: RuntimeKind; setRuntimeKind: (v: RuntimeKind) => void
+  safetyMode: SafetyMode; setSafetyMode: (v: SafetyMode) => void
   prompt: string; setPrompt: (v: string) => void
   health: Record<string, unknown> | null; activeCount: number
   canSpawn: boolean; onSpawn: () => void; onBack: () => void
@@ -1490,15 +1571,23 @@ function SettingsPanel({
         <h2 className="mb-6 text-[18px] font-semibold text-mm-text">Agent Configuration</h2>
 
         <div className="space-y-5">
-          <Field label="Model ID" hint="Any local or API model identifier accepted by the selected runtime.">
+          <Field label="Model ID" hint="A model identifier accepted by the selected provider.">
             <input value={modelId} onChange={(e) => setModelId(e.target.value)} className={inputCls} />
           </Field>
 
           <Field label="Runtime">
             <select value={runtimeKind} onChange={(e) => handleRuntimeChange(e.target.value as RuntimeKind)} className={inputCls}>
-              <option value="local-command">Local command</option>
               <option value="openai-compatible">OpenAI-compatible API</option>
               <option value="anthropic">Anthropic API</option>
+            </select>
+          </Field>
+
+          <Field label="MCP Safety Mode" hint="Tool calls are always explicit in Ask mode; Auto runs only classified read-only tools without prompting.">
+            <select value={safetyMode} onChange={(e) => setSafetyMode(e.target.value as SafetyMode)} className={inputCls}>
+              <option value="plan">Plan only — block write/exec tools</option>
+              <option value="ask">Always ask — recommended</option>
+              <option value="auto">Auto-read — ask for write/exec</option>
+              <option value="yolo">YOLO — no approvals</option>
             </select>
           </Field>
 
@@ -1582,7 +1671,7 @@ function SettingsPanel({
             <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-[13px]">
               <div className="flex min-w-0 items-center justify-between gap-2"><span className="truncate text-mm-text-secondary">Active agents</span><span className="shrink-0 font-mono text-mm-text">{activeCount}</span></div>
               <div className="flex min-w-0 items-center justify-between gap-2"><span className="truncate text-mm-text-secondary">Max agents</span><span className="shrink-0 font-mono text-mm-text">{String(health?.maxActiveAgents ?? '-')}</span></div>
-              <div className="flex min-w-0 items-center justify-between gap-2"><span className="truncate text-mm-text-secondary">Runner binary</span><span className="shrink-0 font-mono text-mm-text">{health?.runnerBinaryPresent ? '✓' : '✗'}</span></div>
+              <div className="flex min-w-0 items-center justify-between gap-2"><span className="truncate text-mm-text-secondary">Runtime</span><span className="shrink-0 font-mono text-mm-text">{String(health?.runtimeKind ?? '-')}</span></div>
               <div className="flex min-w-0 items-center justify-between gap-2"><span className="truncate text-mm-text-secondary">Log buffer</span><span className="shrink-0 font-mono text-mm-text">{MAX_LOGS}</span></div>
             </div>
           </div>
@@ -1593,7 +1682,6 @@ function SettingsPanel({
             </h3>
             <div className="space-y-1 font-mono text-[13px] text-mm-text-secondary">
               <div>drwxr-xr-x sandbox/</div>
-              <div>drwxr-xr-x models/</div>
               <div>drwxr-xr-x logs/</div>
               <div>-rw-r--r-- telemetry.json</div>
             </div>
@@ -1604,8 +1692,7 @@ function SettingsPanel({
               <Zap size={14} /> Runtime Config
             </h3>
             <p className="text-[13px] leading-5 text-mm-text-secondary">
-              Local command mode uses <code className="rounded bg-mm-surface-hover px-1.5 py-0.5 text-mm-accent">HARNESS_RUNNER_BINARY</code> and{' '}
-              <code className="rounded bg-mm-surface-hover px-1.5 py-0.5 text-mm-accent">HARNESS_RUNNER_ARGS_TEMPLATE</code>. API keys stay on the backend.
+              OpenAI-compatible and Anthropic requests run on the backend. API keys stay in the backend environment and are never bundled into the frontend.
             </p>
             <div className="mt-3 flex items-center gap-1.5 text-[12px] text-mm-text-tertiary">
               <Zap size={12} /> Bounded log stream prevents UI memory blowups

@@ -8,10 +8,11 @@
     "backend:typecheck": "cd backend && bunx tsc --noEmit",
     "frontend:dev": "cd frontend && bun run dev -- --host 127.0.0.1 --port 11432",
     "frontend:lint": "cd frontend && bun run lint",
+    "frontend:test": "cd frontend && bun test",
     "frontend:build": "cd frontend && bun run build",
     "smoke": "bun scripts/smoke-test.ts",
-    "bonsai:e2e": "bun scripts/bonsai-e2e.ts",
-    "verify:beta": "bun run backend:typecheck && bun run backend:test && bun run frontend:lint && bun run frontend:build"
+    "provider:e2e": "bun scripts/provider-e2e.ts",
+    "verify:beta": "bun run backend:typecheck && bun run backend:test && bun run frontend:lint && bun run frontend:test && bun run frontend:build"
   },
   "dependencies": {
     "clsx": "^2.1.1",

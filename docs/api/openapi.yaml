@@ -1,212 +1,143 @@
 openapi: 3.1.0
 info:
-  title: Generic Model Harness API
-  version: 0.1.0-beta.1
-  summary: Local and OpenAI-compatible model orchestration harness API for beta verification.
+  title: Bonsai Harness API
+  version: 0.2.0
+  summary: Loopback OpenAI-compatible and Anthropic agent harness with MCP and an OpenCode Zen relay.
 servers:
-  - url: http://localhost:11431
-    description: Claimed beta backend port
+  - url: http://127.0.0.1:11431
+    description: Default loopback backend
 paths:
   /health:
     get:
-      summary: Report harness health and runtime configuration without exposing secrets.
       operationId: getHealth
+      summary: Return runtime-safe harness status without provider keys.
       responses:
-        "200":
-          description: Harness runtime status.
-          content:
-            application/json:
-              schema:
-                $ref: "#/$defs/HealthPayload"
-  /mcp/local-fs:
+        '200':
+          description: Runtime status.
+  /gateway:
     post:
-      summary: Start the local filesystem MCP probe process.
-      operationId: connectLocalFilesystemMcp
+      operationId: relayOpenCodeZen
+      summary: Relay one GET or POST only to https://opencode.ai/zen/v1.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/$defs/GatewayRequest'
       responses:
-        "200":
-          description: MCP process accepted.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [ok]
-                properties:
-                  ok:
-                    type: boolean
-webhooks: {}
+        '200': { description: Upstream response is propagated. }
+        '400': { description: Invalid envelope or disallowed upstream. }
+        '502': { description: Upstream connection failure. }
+        '504': { description: Upstream timeout. }
+  /api/settings:
+    get:
+      operationId: getProviderSettings
+      summary: Get provider settings with key-presence booleans only.
+      responses:
+        '200': { description: Settings snapshot. }
+    put:
+      operationId: updateProviderSettings
+      summary: Validate and persist provider settings in backend .env.local.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/$defs/SettingsUpdate'
+      responses:
+        '200': { description: Updated safe snapshot. }
+        '400': { description: Invalid settings update. }
+  /api/mcp/servers:
+    get:
+      operationId: listMcpServers
+      summary: List registry summaries and whether each local entry point is available or connected.
+      responses:
+        '200': { description: MCP server inventory. }
+  /api/mcp/servers/{name}/connect:
+    post:
+      operationId: connectMcpServer
+      summary: Start an installed MCP stdio server and discover its tools.
+      parameters:
+        - $ref: '#/$defs/McpServerName'
+      responses:
+        '200': { description: Connection summary. }
+        '400': { description: Unknown, unavailable, or invalid MCP server. }
+  /api/mcp/servers/{name}:
+    delete:
+      operationId: disconnectMcpServer
+      summary: Stop one connected MCP process.
+      parameters:
+        - $ref: '#/$defs/McpServerName'
+      responses:
+        '200': { description: MCP server disconnected. }
+        '404': { description: MCP server was not connected. }
 $defs:
-  ModelRuntimeKind:
+  McpServerName:
+    name: name
+    in: path
+    required: true
+    schema: { type: string, minLength: 1 }
+  RuntimeKind:
     type: string
-    enum: [local-command, openai-compatible]
-  HealthPayload:
+    enum: [openai-compatible, anthropic]
+  SafetyMode:
+    type: string
+    enum: [plan, ask, auto, yolo]
+  GatewayRequest:
     type: object
-    required:
-      - ok
-      - service
-      - port
-      - activeAgents
-      - maxActiveAgents
-      - mcpConnections
-      - modelId
-      - runtimeKind
-      - sandboxRoot
+    additionalProperties: false
+    required: [targetUrl]
     properties:
-      ok:
-        type: boolean
-      service:
-        type: string
-        const: bonsai-harness
-      port:
-        type: integer
-        minimum: 10000
-        maximum: 65535
-      activeAgents:
-        type: integer
-        minimum: 0
-      maxActiveAgents:
-        type: integer
-        minimum: 1
-        maximum: 16
-      mcpConnections:
-        type: integer
-        minimum: 0
-      modelId:
-        type: string
-      runtimeKind:
-        $ref: "#/$defs/ModelRuntimeKind"
-      sandboxRoot:
-        type: string
-      error:
-        type: string
-      runnerBinaryPath:
-        type: string
-      runnerBinaryPresent:
-        type: boolean
-      runnerArgsTemplate:
-        type: string
-      modelCacheDir:
-        type: string
-      cacheDir:
-        type: string
-      apiBaseUrl:
-        type: string
-      apiPath:
-        type: string
-      apiKeyPresent:
-        type: boolean
-      maxTokens:
-        type: number
-      temperature:
-        type: number
+      targetUrl: { type: string, format: uri, pattern: '^https://opencode\\.ai/zen/v1(?:/|$)' }
+      method: { type: string, enum: [GET, POST], default: POST }
+      headers:
+        type: object
+        additionalProperties: { type: string }
+      body: { type: string }
+  SettingsUpdate:
+    type: object
+    properties:
+      runtimeKind: { $ref: '#/$defs/RuntimeKind' }
+      modelId: { type: string, minLength: 1 }
+      openai:
+        type: object
+        properties:
+          apiBaseUrl: { type: string, format: uri }
+          apiPath: { type: string, pattern: '^/[^?#\\]*$' }
+          apiKey: { type: string, writeOnly: true }
+          maxTokens: { type: number, minimum: 1, maximum: 128000 }
+          temperature: { type: number, minimum: 0, maximum: 2 }
+      anthropic:
+        type: object
+        properties:
+          apiBaseUrl: { type: string, format: uri }
+          apiKey: { type: string, writeOnly: true }
+          maxTokens: { type: number, minimum: 1, maximum: 128000 }
+          temperature: { type: number, minimum: 0, maximum: 2 }
   WebSocketClientMessage:
     oneOf:
-      - $ref: "#/$defs/SpawnAgentMessage"
-      - $ref: "#/$defs/WriteSandboxMessage"
-  SpawnAgentMessage:
-    type: object
-    required: [action, agentId, prompt]
-    properties:
-      action:
-        type: string
-        const: spawn_agent
-      agentId:
-        type: string
-        minLength: 1
-      prompt:
-        type: string
-        minLength: 1
-      modelId:
-        type: string
-        description: Arbitrary model identifier passed to the selected runtime.
-      runtimeKind:
-        $ref: "#/$defs/ModelRuntimeKind"
-  WriteSandboxMessage:
-    type: object
-    required: [action, filename, content]
-    properties:
-      action:
-        type: string
-        const: write_sandbox
-      filename:
-        type: string
-        minLength: 1
-      content:
-        type: string
-  HarnessEvent:
-    oneOf:
-      - $ref: "#/$defs/StatusEvent"
-      - $ref: "#/$defs/ErrorEvent"
-      - $ref: "#/$defs/InferenceEvent"
-      - $ref: "#/$defs/AgentExitEvent"
-      - $ref: "#/$defs/McpResponseEvent"
-      - $ref: "#/$defs/SandboxWriteEvent"
-  StatusEvent:
-    type: object
-    required: [type, payload]
-    properties:
-      type:
-        type: string
-        const: status
-      payload:
-        type: string
-  ErrorEvent:
-    type: object
-    required: [type, payload]
-    properties:
-      type:
-        type: string
-        const: error
-      payload:
-        type: string
-      agentId:
-        type: string
-  InferenceEvent:
-    type: object
-    required: [type, agentId, payload]
-    properties:
-      type:
-        type: string
-        const: inference
-      agentId:
-        type: string
-      payload:
-        type: string
-  AgentExitEvent:
-    type: object
-    required: [type, agentId, code, signal]
-    properties:
-      type:
-        type: string
-        const: agent_exit
-      agentId:
-        type: string
-      code:
-        type:
-          - integer
-          - "null"
-      signal:
-        type:
-          - string
-          - "null"
-  McpResponseEvent:
-    type: object
-    required: [type, server, payload]
-    properties:
-      type:
-        type: string
-        const: mcp_response
-      server:
-        type: string
-      payload:
-        type: string
-  SandboxWriteEvent:
-    type: object
-    required: [type, path, payload]
-    properties:
-      type:
-        type: string
-        const: sandbox_write
-      path:
-        type: string
-      payload:
-        type: string
+      - type: object
+        required: [action, agentId, prompt]
+        properties:
+          action: { const: spawn_agent }
+          agentId: { type: string, minLength: 1 }
+          prompt: { type: string, minLength: 1 }
+          modelId: { type: string }
+          runtimeKind: { $ref: '#/$defs/RuntimeKind' }
+          safetyMode: { $ref: '#/$defs/SafetyMode' }
+      - type: object
+        required: [action, payload]
+        properties:
+          action: { const: send_message }
+          payload: { type: string, minLength: 1 }
+          safetyMode: { $ref: '#/$defs/SafetyMode' }
+      - type: object
+        required: [action, requestId, approved]
+        properties:
+          action: { const: resolve_tool_approval }
+          requestId: { type: string, minLength: 1 }
+          approved: { type: boolean }
+      - type: object
+        required: [action]
+        properties:
+          action: { const: stop_generation }

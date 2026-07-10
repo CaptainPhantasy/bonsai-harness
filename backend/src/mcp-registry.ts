@@ -310,16 +310,31 @@ export interface McpServerSummary {
   version: string;
   toolCount: number;
   source: McpSource;
+  available: boolean;
+  unavailableReason?: string;
 }
 
 export function listMcpServerSummaries(): McpServerSummary[] {
-  return MCP_REGISTRY.map((s) => ({
-    name: s.name,
-    displayName: s.displayName,
-    description: s.description,
-    transport: s.transport,
-    version: s.version,
-    toolCount: s.toolCount,
-    source: s.source,
-  }));
+  return MCP_REGISTRY.map((server) => {
+    const unavailableReason = getMcpServerUnavailableReason(server);
+    return {
+      name: server.name,
+      displayName: server.displayName,
+      description: server.description,
+      transport: server.transport,
+      version: server.version,
+      toolCount: server.toolCount,
+      source: server.source,
+      available: unavailableReason === undefined,
+      ...(unavailableReason === undefined ? {} : { unavailableReason }),
+    };
+  });
 }
+
+export function getMcpServerUnavailableReason(server: McpServerEntry): string | undefined {
+  const entryPoint = server.args.find((arg) => arg.startsWith("/"));
+  if (entryPoint && !existsSync(entryPoint)) return "Server entry point is not installed on this machine";
+  if (server.command.startsWith("/") && !existsSync(server.command)) return "Server executable is not installed on this machine";
+  return undefined;
+}
+import { existsSync } from "node:fs";

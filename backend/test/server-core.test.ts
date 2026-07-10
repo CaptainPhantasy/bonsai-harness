@@ -3,19 +3,23 @@ import { describe, expect, test } from "bun:test";
 import {
   assertSpawnCapacity,
   buildAnthropicRequest,
-  buildLocalCommandArguments,
+  buildAnthropicConversationRequest,
   buildOpenAiCompatibleRequest,
+  buildOpenAiCompatibleConversationRequest,
   createSandboxPath,
   healthPayload,
   isModelRuntimeKind,
   parseClientMessage,
   readSettingsSnapshot,
   resolveAnthropicApiKey,
+  resolveBindHost,
   resolveDefaultModelId,
   resolveMaxActiveAgents,
   resolveModelRuntime,
   resolvePort,
   resolveSandboxRoot,
+  resolveOpenAiApiPath,
+  parseSettingsUpdate,
   type ModelRuntimeKind,
 } from "../src/server-core";
 
@@ -62,12 +66,28 @@ describe("server core", () => {
       agentId: "Worker-2",
       prompt: "Run",
       runtimeKind: "bonsai-only",
-    }))).toThrow("spawn_agent runtimeKind must be one of: local-command, openai-compatible, anthropic");
+    }))).toThrow("spawn_agent runtimeKind must be one of: openai-compatible, anthropic");
   });
 
   test("parseClientMessage accepts stop_generation action", () => {
     const message = parseClientMessage(JSON.stringify({ action: "stop_generation" }));
     expect(message).toEqual({ action: "stop_generation" });
+  });
+
+  test("parseClientMessage validates MCP safety modes and approval resolution", () => {
+    expect(parseClientMessage(JSON.stringify({
+      action: "spawn_agent",
+      agentId: "ToolWorker",
+      prompt: "Use connected tools safely",
+      safetyMode: "ask",
+    }))).toMatchObject({ action: "spawn_agent", safetyMode: "ask" });
+    expect(parseClientMessage(JSON.stringify({
+      action: "resolve_tool_approval",
+      requestId: "approval-1",
+      approved: true,
+    }))).toEqual({ action: "resolve_tool_approval", requestId: "approval-1", approved: true });
+    expect(() => parseClientMessage(JSON.stringify({ action: "resolve_tool_approval", requestId: "", approved: true }))).toThrow("requestId");
+    expect(() => parseClientMessage(JSON.stringify({ action: "send_message", payload: "Run", safetyMode: "unsafe" }))).toThrow("safetyMode");
   });
 
   test("parseClientMessage passes through file attachments in send_message", () => {
@@ -90,26 +110,9 @@ describe("server core", () => {
     }
   });
 
-  test("resolveDefaultModelId uses generic env override while Bonsai remains the default value", () => {
-    expect(resolveDefaultModelId({})).toBe("prism-ml/Ternary-Bonsai-8B-mlx-2bit");
+  test("resolveDefaultModelId uses a provider-neutral default and supports an env override", () => {
+    expect(resolveDefaultModelId({})).toBe("gpt-4o-mini");
     expect(resolveDefaultModelId({ HARNESS_MODEL_ID: "local/slm" })).toBe("local/slm");
-  });
-
-  test("resolveModelRuntime defaults to a local command runtime with swappable binary, args, and cache paths", () => {
-    expect(resolveModelRuntime({
-      HARNESS_MODEL_ID: "local/slm",
-      HARNESS_RUNNER_BINARY: "/bin/echo",
-      HARNESS_RUNNER_ARGS_TEMPLATE: "run --model {{modelId}} --prompt {{prompt}} --cache {{cacheDir}}",
-      HARNESS_CACHE_DIR: "/tmp/harness-cache",
-      HARNESS_RUNTIME_KIND: "local-command",
-    })).toEqual({
-      kind: "local-command",
-      modelId: "local/slm",
-      runnerBinaryPath: "/bin/echo",
-      runnerArgsTemplate: "run --model {{modelId}} --prompt {{prompt}} --cache {{cacheDir}}",
-      modelCacheDir: "/Volumes/SanDisk1Tb/HFModels",
-      cacheDir: "/tmp/harness-cache",
-    });
   });
 
   test("resolveModelRuntime supports OpenAI-compatible API runtime without exposing the API key", () => {
@@ -151,6 +154,12 @@ describe("server core", () => {
     );
   });
 
+  test("resolveBindHost defaults to loopback and rejects an accidental network bind", () => {
+    expect(resolveBindHost({})).toBe("127.0.0.1");
+    expect(resolveBindHost({ HARNESS_BIND_HOST: "0.0.0.0" })).toBe("0.0.0.0");
+    expect(() => resolveBindHost({ HARNESS_BIND_HOST: "192.168.1.25" })).toThrow("HARNESS_BIND_HOST");
+  });
+
   test("resolveSandboxRoot supports generic container and launchd overrides", () => {
     expect(resolveSandboxRoot({ HARNESS_SANDBOX_ROOT: "/tmp/harness-container" })).toBe(
       "/tmp/harness-container",
@@ -163,25 +172,6 @@ describe("server core", () => {
       "HARNESS_MAX_ACTIVE_AGENTS must be between 1 and 64",
     );
     expect(() => assertSpawnCapacity(2, 2)).toThrow("active agents at capacity");
-  });
-
-  test("buildLocalCommandArguments applies model, prompt, and cache placeholders without splitting prompt text", () => {
-    expect(buildLocalCommandArguments(
-      "run --model {{modelId}} --prompt {{prompt}} --cache {{cacheDir}}",
-      "vendor/model",
-      "Role prompt with spaces",
-      "/tmp/cache path",
-      "/tmp/model-cache",
-      "local-command",
-    )).toEqual([
-      "run",
-      "--model",
-      "vendor/model",
-      "--prompt",
-      "Role prompt with spaces",
-      "--cache",
-      "/tmp/cache path",
-    ]);
   });
 
   test("buildOpenAiCompatibleRequest creates request metadata without leaking server-side API key", () => {
@@ -204,6 +194,34 @@ describe("server core", () => {
         temperature: 0.1,
       },
     });
+  });
+
+  test("provider conversation builders translate connected MCP tools into both provider contracts", () => {
+    const tools = [{ name: "fixture__read_note", description: "Read a note", inputSchema: { type: "object", properties: {} } }];
+    const openai = buildOpenAiCompatibleConversationRequest({
+      kind: "openai-compatible",
+      modelId: "test-model",
+      apiBaseUrl: "https://api.example.test",
+      apiPath: "/v1/chat/completions",
+      maxTokens: 32,
+      temperature: 0.2,
+    }, [{ role: "user", content: "Read the note" }], tools);
+    const anthropic = buildAnthropicConversationRequest({
+      kind: "anthropic",
+      modelId: "test-model",
+      apiBaseUrl: "https://api.example.test",
+      maxTokens: 32,
+      temperature: 0.2,
+    }, [{ role: "user", content: "Read the note" }], tools);
+
+    expect(openai.body.tools).toEqual([{ type: "function", function: { name: "fixture__read_note", description: "Read a note", parameters: { type: "object", properties: {} } } }]);
+    expect(openai.body.tool_choice).toBe("auto");
+    expect(anthropic.body.tools).toEqual([{ name: "fixture__read_note", description: "Read a note", input_schema: { type: "object", properties: {} } }]);
+  });
+
+  test("resolveOpenAiApiPath avoids double /v1 when base already includes /v1", () => {
+    expect(resolveOpenAiApiPath("https://opencode.ai/zen/v1", "/v1/chat/completions")).toBe("https://opencode.ai/zen/v1/chat/completions");
+    expect(resolveOpenAiApiPath("https://opencode.ai/zen/v1", "/chat/completions")).toBe("https://opencode.ai/zen/v1/chat/completions");
   });
 
   test("healthPayload reports generic runtime state without API secrets", () => {
@@ -277,7 +295,6 @@ describe("server core", () => {
 
   test("isModelRuntimeKind accepts anthropic as a valid runtime kind", () => {
     expect(isModelRuntimeKind("anthropic")).toBe(true);
-    expect(isModelRuntimeKind("local-command")).toBe(true);
     expect(isModelRuntimeKind("openai-compatible")).toBe(true);
     expect(isModelRuntimeKind("invalid")).toBe(false);
   });
@@ -300,9 +317,38 @@ describe("server core", () => {
 
   test("readSettingsSnapshot uses sensible defaults for unset env vars", () => {
     const snapshot = readSettingsSnapshot({});
-    expect(snapshot.runtimeKind).toBe("local-command");
+    expect(snapshot.runtimeKind).toBe("openai-compatible");
     expect(snapshot.openai.apiKeySet).toBe(false);
     expect(snapshot.anthropic.apiKeySet).toBe(false);
     expect(snapshot.anthropic.apiBaseUrl).toBe("https://api.anthropic.com");
+  });
+
+  test("requested model IDs override the configured default for both provider runtimes", () => {
+    const openai = resolveModelRuntime({
+      HARNESS_RUNTIME_KIND: "openai-compatible",
+      HARNESS_MODEL_ID: "configured-default",
+      HARNESS_API_BASE_URL: "https://api.example.test",
+      HARNESS_API_KEY: "secret",
+    }, { modelId: "requested-model" });
+    const anthropic = resolveModelRuntime({
+      HARNESS_RUNTIME_KIND: "anthropic",
+      HARNESS_MODEL_ID: "configured-default",
+      ANTHROPIC_API_KEY: "secret",
+    }, { modelId: "requested-model" });
+
+    expect(openai.modelId).toBe("requested-model");
+    expect(anthropic.modelId).toBe("requested-model");
+  });
+
+  test("parseSettingsUpdate validates provider configuration before it can reach .env.local", () => {
+    expect(parseSettingsUpdate({
+      runtimeKind: "openai-compatible",
+      modelId: "gpt-4o-mini",
+      openai: { apiBaseUrl: "https://opencode.ai/zen/v1", apiPath: "/v1/chat/completions", maxTokens: 256, temperature: 0.2 },
+    })).toMatchObject({ runtimeKind: "openai-compatible", modelId: "gpt-4o-mini" });
+    expect(() => parseSettingsUpdate({ runtimeKind: "local-command" })).toThrow("runtimeKind");
+    expect(() => parseSettingsUpdate({ openai: { apiKey: "secret\ninjected=true" } })).toThrow("single-line");
+    expect(() => parseSettingsUpdate({ openai: { apiBaseUrl: "https://user:pass@example.test" } })).toThrow("without credentials");
+    expect(() => parseSettingsUpdate({ openai: { apiPath: "https://example.test/v1" } })).toThrow("absolute path");
   });
 });
