@@ -11,7 +11,7 @@ export default defineConfig(({ mode }) => {
     base: '/bonsai/',
     plugins: [react()],
     server: {
-      allowedHosts: ['localhost', '127.0.0.1'],
+      allowedHosts: ['localhost', '127.0.0.1', 'douglass-mac-mini.tail58d565.ts.net'],
       hmr: false,
       proxy: {
         '/api': proxy(),
