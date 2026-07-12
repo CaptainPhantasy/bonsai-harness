@@ -19,7 +19,7 @@
  */
 
 export type McpTransport = "stdio" | "stdio+http";
-export type McpSource = "local-storage" | "desktop-app" | "aterm";
+export type McpSource = "local-storage" | "desktop-app" | "aterm" | "mcp-gateway";
 
 export interface McpServerEntry {
   /** Stable machine-readable name used as the registry key. */
@@ -48,6 +48,7 @@ export interface McpServerEntry {
 
 const STORAGE_ROOT = "/Volumes/Storage/MCP";
 const DC_ROOT = "/Applications/Desktop Commander.app/Contents/Resources/bundled-mcpb";
+const GATEWAY_ROOT = "/Volumes/applebottom/untitled folder/MCP_SERVER_ROOM/mcp-gateway";
 
 /**
  * Single source of truth for every MCP the harness knows about.
@@ -70,6 +71,24 @@ export const MCP_REGISTRY: readonly McpServerEntry[] = [
     version: "0.2.38",
     toolCount: 38,
     source: "desktop-app",
+  },
+
+  // ─── mcp-gateway (legacy ai fleet proxy, /Volumes/applebottom) ────────────
+  // Spawns the gateway directly over stdio. Bonsai is a Bun process, not a
+  // browser, so the HTTP supergateway bridge (:11772) was rejected as a
+  // failure-mode-for-zero-benefit hop (verified empirically — bridges return
+  // HTTP 400 "No valid session ID provided" without a prior initialize).
+  {
+    name: "mcp-gateway",
+    displayName: "MCP Gateway",
+    description: "Legacy AI fleet proxy — call_tool/describe_tool across the wired MCP fleet",
+    command: "node",
+    args: [`${GATEWAY_ROOT}/dist/index.js`],
+    env: {},
+    transport: "stdio",
+    version: "2.0.0",
+    toolCount: 4,
+    source: "mcp-gateway",
   },
 
   // ─── /Volumes/Storage/MCP (deduped, V2 preferred) ──────────────────────────

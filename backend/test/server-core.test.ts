@@ -17,7 +17,11 @@ import {
   resolveMaxActiveAgents,
   resolveModelRuntime,
   resolvePort,
+  resolveProjectRoot,
   resolveSandboxRoot,
+  resolveMemoryPath,
+  getMemoryRoot,
+  getConversationsDir,
   resolveOpenAiApiPath,
   parseSettingsUpdate,
   type ModelRuntimeKind,
@@ -350,5 +354,25 @@ describe("server core", () => {
     expect(() => parseSettingsUpdate({ openai: { apiKey: "secret\ninjected=true" } })).toThrow("single-line");
     expect(() => parseSettingsUpdate({ openai: { apiBaseUrl: "https://user:pass@example.test" } })).toThrow("without credentials");
     expect(() => parseSettingsUpdate({ openai: { apiPath: "https://example.test/v1" } })).toThrow("absolute path");
+  });
+
+  test("resolveProjectRoot accepts the canonical project root and rejects non-project dirs", () => {
+    expect(resolveProjectRoot({})).toBe("/Volumes/SanDisk1Tb/bonsai-harness");
+    expect(resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/Volumes/SanDisk1Tb/bonsai-harness" })).toBe("/Volumes/SanDisk1Tb/bonsai-harness");
+    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/tmp" })).toThrow("package.json or FLOYD.md");
+    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/Volumes/SanDisk1Tb/bonsai-harness/backend/src" })).toThrow("package.json or FLOYD.md");
+    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/Volumes/SanDisk1Tb/bonsai-harness/nonexistent-dir-xyz" })).toThrow("does not exist");
+    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/Volumes/SanDisk1Tb/bonsai-harness/FLOYD.md" })).toThrow("must be a directory");
+  });
+
+  test("resolveMemoryPath scopes paths under <projectRoot>/.bonsai/memory and rejects escapes", () => {
+    expect(resolveMemoryPath("conversations/abc-123.jsonl", "/proj")).toBe("/proj/.bonsai/memory/conversations/abc-123.jsonl");
+    expect(resolveMemoryPath("vault/note.md", "/proj")).toBe("/proj/.bonsai/memory/vault/note.md");
+    expect(getMemoryRoot("/proj")).toBe("/proj/.bonsai/memory");
+    expect(getConversationsDir("/proj")).toBe("/proj/.bonsai/memory/conversations");
+    expect(() => resolveMemoryPath("", "/proj")).toThrow("non-empty");
+    expect(() => resolveMemoryPath("   ", "/proj")).toThrow("non-empty");
+    expect(() => resolveMemoryPath("/etc/passwd", "/proj")).toThrow("relative path within the project memory root");
+    expect(() => resolveMemoryPath("../../escape.jsonl", "/proj")).toThrow("relative path within the project memory root");
   });
 });

@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "generatedAt": "2026-07-11",
+  "source": ".planning/2026-07-10-dual-model-router-governor-advisor/model_lineup_snapshot_2026-07-11.md",
+  "notes": "Catalog-driven model config. Per Decision 3 (LOCKED): no if (model === ...) branches in runtime code; per-model reasoning config lives here as data. Provider endpoints and credential env vars are declared once at the provider level and inherited by every model in that provider.",
+  "providers": {
+    "zai": {
+      "displayName": "Z.AI (GLM Coding Plan)",
+      "runtimeKind": "openai-compatible",
+      "apiBaseUrl": "https://api.z.ai",
+      "apiPath": "/api/coding/paas/v4/chat/completions",
+      "credentialEnv": "HARNESS_API_KEY",
+      "authBrokerProvider": "zai",
+      "subscription": "Coding Plan Max ($160/mo, ~1,600 prompts/5hr, ~8,000/week, 4,000 MCP/mo)"
+    },
+    "minimax": {
+      "displayName": "MiniMax (Coding Plan Plus)",
+      "runtimeKind": "openai-compatible",
+      "apiBaseUrl": "https://api.minimax.io",
+      "apiPath": "/v1/chat/completions",
+      "credentialEnv": "HARNESS_BACKUP_API_KEY",
+      "authBrokerProvider": "minimax-code",
+      "subscription": "Coding Plan Plus (annual, text-only) + ~50,000 leftover Credits (finite, all modalities)"
+    }
+  },
+  "models": [
+    {
+      "id": "glm-5.2",
+      "displayName": "GLM-5.2",
+      "provider": "zai",
+      "context": 1000000,
+      "maxOutput": 131072,
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "reasoning": { "kind": "always-on", "budgetTokens": 1024, "effort": "high" },
+      "rateLimits": { "rpm": null, "quotaTier": 1, "peakMultiplier": 3, "offPeakMultiplier": 2 },
+      "roles": ["primary-deep-reasoning", "governor"],
+      "notes": "Terminal-Bench 81. Always-on reasoning. Flagship deep specialist. Promo: off-peak drops to 1× through Sept 2026."
+    },
+    {
+      "id": "glm-5-turbo",
+      "displayName": "GLM-5 Turbo",
+      "provider": "zai",
+      "context": 200000,
+      "maxOutput": 65536,
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "reasoning": { "kind": "toggleable", "budgetTokens": 1024, "effort": "medium" },
+      "rateLimits": { "rpm": null, "quotaTier": 1, "peakMultiplier": 3, "offPeakMultiplier": 2 },
+      "roles": ["fast-deep-reasoning"],
+      "notes": "Same family as 5.2, lower latency for medium-complexity work."
+    },
+    {
+      "id": "glm-4.7",
+      "displayName": "GLM-4.7",
+      "provider": "zai",
+      "context": 200000,
+      "maxOutput": 131072,
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "reasoning": { "kind": "toggleable", "budgetTokens": 1024, "effort": "medium" },
+      "rateLimits": { "rpm": null, "quotaTier": 1, "peakMultiplier": 1, "offPeakMultiplier": 1 },
+      "roles": ["routine-tasks", "high-output"],
+      "notes": "Z.AI-recommended routine model. 131K max output. No peak multiplier documented."
+    },
+    {
+      "id": "glm-4.5-air",
+      "displayName": "GLM-4.5 Air",
+      "provider": "zai",
+      "context": 131072,
+      "maxOutput": 98304,
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "reasoning": { "kind": "toggleable", "budgetTokens": 512, "effort": "low" },
+      "rateLimits": { "rpm": null, "quotaTier": 1, "peakMultiplier": 1, "offPeakMultiplier": 1 },
+      "roles": ["lightweight", "cheap"],
+      "notes": "Cheapest in plan. Ultra-low quota burn for simple stuff."
+    },
+    {
+      "id": "glm-4.6v",
+      "displayName": "GLM-4.6 Vision",
+      "provider": "zai",
+      "context": 131072,
+      "maxOutput": 8192,
+      "modalities": { "input": ["text", "image"], "output": ["text"] },
+      "reasoning": { "kind": "toggleable", "budgetTokens": 1024, "effort": "medium" },
+      "rateLimits": { "rpm": null, "quotaTier": 1, "peakMultiplier": 1, "offPeakMultiplier": 1 },
+      "roles": ["vision-input"],
+      "notes": "Verified 2026-07-11: returns HTTP 200 on Coding Plan endpoint with image input. Routes vision workloads alongside MiniMax-M3; cheaper quota tier (Coding Plan Max, renewable) than M3.",
+      "planCoverage": "verified"
+    },
+
+    {
+      "id": "MiniMax-M3",
+      "displayName": "MiniMax M3",
+      "provider": "minimax",
+      "context": 1000000,
+      "maxOutput": 8192,
+      "modalities": { "input": ["text", "image", "video"], "output": ["text"] },
+      "reasoning": { "kind": "toggleable", "budgetTokens": 1024, "effort": "medium" },
+      "rateLimits": { "rpm": 200, "quotaTier": 2 },
+      "roles": ["multimodal-primary", "vision-input", "advisor-verifier"],
+      "notes": "OSWorld 70, BrowseComp 83. 1M context, image+video input, toggleable thinking. RPM is 40% of every other M-series model — prefer M2.7 family for parallel dispatch. Note: M3 returns reasoning inline as <think>...</think> in content, not as a separate reasoning_content channel (unlike GLM).",
+      "planCoverage": "verified"
+    },
+    {
+      "id": "MiniMax-M2.7",
+      "displayName": "MiniMax M2.7",
+      "provider": "minimax",
+      "context": 204800,
+      "maxOutput": 8192,
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "reasoning": { "kind": "off", "budgetTokens": 0, "effort": "none" },
+      "rateLimits": { "rpm": 500, "quotaTier": 2 },
+      "roles": ["high-throughput-text", "parallel-dispatch"],
+      "notes": "Previous frontier text. 2.5× M3 RPM. Use for parallel candidates and race-mode fanout."
+    },
+    {
+      "id": "MiniMax-M2.7-highspeed",
+      "displayName": "MiniMax M2.7 Highspeed",
+      "provider": "minimax",
+      "context": 204800,
+      "maxOutput": 8192,
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "reasoning": { "kind": "off", "budgetTokens": 0, "effort": "none" },
+      "rateLimits": { "rpm": 500, "quotaTier": 2 },
+      "roles": ["fast-text", "chat-class"],
+      "notes": "Fast variant of M2.7. Same RPM, lower latency."
+    },
+    {
+      "id": "MiniMax-M2.5-highspeed",
+      "displayName": "MiniMax M2.5 Highspeed",
+      "provider": "minimax",
+      "context": 204800,
+      "maxOutput": 8192,
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "reasoning": { "kind": "off", "budgetTokens": 0, "effort": "none" },
+      "rateLimits": { "rpm": 500, "quotaTier": 2 },
+      "roles": ["cheap-fast-text"],
+      "notes": "Older gen, still 500 RPM, lower cost."
+    },
+    {
+      "id": "MiniMax-M2.1-highspeed",
+      "displayName": "MiniMax M2.1 Highspeed",
+      "provider": "minimax",
+      "context": 204800,
+      "maxOutput": 8192,
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "reasoning": { "kind": "off", "budgetTokens": 0, "effort": "none" },
+      "rateLimits": { "rpm": 500, "quotaTier": 2 },
+      "roles": ["disposable", "cheapest"],
+      "notes": "Simplest replies, lowest tier, 500 RPM. Use for fanout where any acceptable response wins."
+    }
+  ],
+  "defaults": {
+    "primaryModelId": "glm-5.2",
+    "backupModelId": "MiniMax-M3",
+    "visionFallbackModelId": "MiniMax-M3",
+    "reasoningBudgetTokens": 1024,
+    "maxAgentToolRounds": 8
+  }
+}

@@ -20,6 +20,7 @@ type HarnessEvent =
   | { type: 'status'; payload: string }
   | { type: 'error'; payload: string; agentId?: string }
   | { type: 'inference'; agentId: string; payload: string }
+  | { type: 'inference_delta'; agentId: string; payload: string; channel: 'content' | 'reasoning' }
   | { type: 'agent_exit'; agentId: string; code: number | null; signal: string | null }
   | { type: 'mcp_response'; server: string; payload: string }
   | { type: 'tool_approval_required'; requestId: string; agentId: string; server: string; tool: string; arguments: Record<string, unknown> }
@@ -32,6 +33,12 @@ type ChatMessage = {
   feedback?: 'up' | 'down' | null
   timestamp: number
   attachments?: AttachedFile[]
+  /**
+   * Active media generation mode when this user message was sent. Set only
+   * via the composer "+" affordance. Persisted on the message so a reloaded
+   * conversation shows which turn activated media generation.
+   */
+  mediaMode?: MediaMode
 }
 
 type AttachedFile = { id: string; name: string; size: number; type: string }
@@ -49,6 +56,26 @@ type ProviderSettings = {
   openai: { apiBaseUrl: string; apiPath: string; apiKey: string; maxTokens: string; temperature: string; apiKeySet: boolean }
   anthropic: { apiBaseUrl: string; apiKey: string; maxTokens: string; temperature: string; apiKeySet: boolean }
 }
+
+type CatalogModel = {
+  id: string
+  displayName: string
+  provider: string
+  context: number
+  maxOutput: number
+  modalities: { input: string[]; output: string[] }
+  roles: string[]
+  reasoning: { kind: string; effort: string }
+  planCoverage?: 'verified' | 'unverified'
+}
+
+type ModelCatalog = {
+  defaults: { primaryModelId: string; backupModelId: string; visionFallbackModelId: string }
+  models: CatalogModel[]
+  providers: Record<string, { displayName: string; runtimeKind: RuntimeKind; subscription: string }>
+}
+
+type MediaMode = 'image' | 'video' | 'audio' | 'music'
 
 type McpServer = {
   name: string
@@ -77,14 +104,20 @@ const RECONNECT_MAX_MS = 30_000
 const HEALTH_POLL_MS = 5_000
 const MAX_LOGS = 250
 const MAX_INPUT_CHARS = 8_000
-const DEFAULT_MODEL_ID = 'gpt-4o-mini'
+// Catalog default carried in the bundle so the model id is non-empty on first
+// paint, before /api/catalog resolves. The catalog effect (below) corrects
+// this if the loaded catalog disagrees. Kept in sync with backend/models.json.
+const DEFAULT_MODEL_ID = 'glm-5.2'
 const DEFAULT_PROMPT = 'You are a deterministic code generation agent optimized for concise inference.'
 const ASSET_BASE = import.meta.env.BASE_URL
 
-const PRESET_MODELS = [
-  { id: 'gpt-4o-mini', label: 'GPT-4o mini', description: 'OpenAI-compatible default' },
-  { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet', description: 'Anthropic Messages API' },
-] as const
+// Media-mode menu options. Order matches the Composer "+" menu render order.
+const MEDIA_MODE_OPTIONS: Array<{ mode: MediaMode; label: string; hint: string }> = [
+  { mode: 'image', label: 'Image generation', hint: 'DALL·E / Stable Diffusion / text-to-image' },
+  { mode: 'video', label: 'Video generation', hint: 'Hailuo / text-to-video' },
+  { mode: 'audio', label: 'Audio / speech', hint: 'TTS, narration, voice clone/design' },
+  { mode: 'music', label: 'Music generation', hint: 'Suno-style text-to-music' },
+]
 
 const SUGGESTED_PROMPTS = [
   { icon: '🔍', label: 'Explain this codebase', prompt: 'Walk me through the architecture of this codebase. Start with entry points.' },
@@ -498,6 +531,9 @@ export default function HarnessDashboard() {
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [settingsLoaded, setSettingsLoaded] = useState(false)
   const [mcpServers, setMcpServers] = useState<McpServer[]>([])
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(null)
+  const [mediaMode, setMediaMode] = useState<MediaMode | null>(null)
+  const [showMediaMenu, setShowMediaMenu] = useState(false)
   const [pendingToolApprovals, setPendingToolApprovals] = useState<PendingToolApproval[]>([])
   const systemTheme = useSystemTheme()
   const effectiveLight = isLight || (theme !== 'bonsai' && systemTheme === 'light')
@@ -517,6 +553,9 @@ export default function HarnessDashboard() {
   const formatEvent = useCallback((event: HarnessEvent) => {
     switch (event.type) {
       case 'inference': return `[${event.agentId}] ${event.payload}`
+      case 'inference_delta': return event.channel === 'reasoning'
+        ? `[${event.agentId}:thinking] ${event.payload}`
+        : `[${event.agentId}:stream] ${event.payload}`
       case 'agent_exit': return `[${event.agentId}] exited code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`
       case 'mcp_response': return `[MCP:${event.server}] ${event.payload}`
       case 'tool_approval_required': return `[APPROVAL:${event.agentId}] ${event.server}.${event.tool} requires approval`
@@ -543,12 +582,30 @@ export default function HarnessDashboard() {
         if (disposed) return
         let data: HarnessEvent
         try { data = JSON.parse(event.data) as HarnessEvent } catch { return }
+        if (data.type === 'inference_delta') {
+          // Token-by-token streaming. Append into the assistant buffer;
+          // the final `inference` event replaces with the complete content.
+          // Reasoning-channel deltas go to the system log only — surfacing
+          // them inline is a separate UX decision.
+          if (data.channel === 'content') {
+            setIsStreaming(true)
+            setChatMessages((prev) => {
+              const last = prev[prev.length - 1]
+              if (last && last.role === 'assistant') {
+                return [...prev.slice(0, -1), { ...last, content: last.content + data.payload }]
+              }
+              return [...prev, { id: generateId(), role: 'assistant', content: data.payload, timestamp: Date.now() }]
+            })
+          }
+        }
         if (data.type === 'inference') {
-          setIsStreaming(true)
+          // Final inference: REPLACE the streaming buffer with clean final
+          // content (strips verdict line, normalizes whitespace).
+          setIsStreaming(false)
           setChatMessages((prev) => {
             const last = prev[prev.length - 1]
             if (last && last.role === 'assistant') {
-              return [...prev.slice(0, -1), { ...last, content: last.content + data.payload }]
+              return [...prev.slice(0, -1), { ...last, content: data.payload }]
             }
             return [...prev, { id: generateId(), role: 'assistant', content: data.payload, timestamp: Date.now() }]
           })
@@ -635,6 +692,28 @@ export default function HarnessDashboard() {
       .catch(() => {})
   }, [sidebarView, settingsLoaded])
 
+  /* ── Catalog Fetch ── */
+  // The catalog is the single source of truth for which models exist and
+  // what the default is (Decision 3 LOCKED). The bundle ships with a
+  // hardcoded fallback default so first paint is non-empty; this effect
+  // corrects the saved model id if it is not in the loaded catalog (e.g.
+  // legacy 'gpt-4o-mini' saved value from before the catalog rewrite).
+  useEffect(() => {
+    let disposed = false
+    apiFetch('/api/catalog')
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => { if (!disposed && data) setCatalog(data as ModelCatalog) })
+      .catch(() => {})
+    return () => { disposed = true }
+  }, [])
+
+  useEffect(() => {
+    if (!catalog) return
+    if (!catalog.models.some((m) => m.id === modelId)) {
+      setModelId(catalog.defaults.primaryModelId)
+    }
+  }, [catalog, modelId, setModelId])
+
   /* ── MCP Server Inventory ── */
   const loadMcpServers = useCallback(async () => {
     try {
@@ -677,18 +756,48 @@ export default function HarnessDashboard() {
   const inputCharsRemaining = MAX_INPUT_CHARS - inputMessage.length
   const inputAtLimit = inputCharsRemaining <= 100
 
+  // Catalog-driven preset list, grouped by provider for the dropdown.
+  const catalogByProvider = useMemo(() => {
+    if (!catalog) return [] as Array<{ providerId: string; providerName: string; models: CatalogModel[] }>
+    const groups = new Map<string, CatalogModel[]>()
+    for (const model of catalog.models) {
+      const arr = groups.get(model.provider) ?? []
+      arr.push(model)
+      groups.set(model.provider, arr)
+    }
+    return [...groups.entries()].map(([providerId, models]) => ({
+      providerId,
+      providerName: catalog.providers[providerId]?.displayName ?? providerId,
+      models,
+    }))
+  }, [catalog])
+
+  const catalogModelLabel = useCallback((id: string): string => {
+    const found = catalog?.models.find((m) => m.id === id)
+    if (found) return found.displayName
+    // Custom id — show the trailing segment so 'vendor/foo-bar' reads as 'foo-bar'
+    return id.split('/').pop() ?? id
+  }, [catalog])
+
   /* ── Stable action callbacks ── */
   const spawnAgent = useCallback(() => {
     const nextId = `Worker-${agents.length + 1}`
     const trimmedModelId = modelId.trim()
     const trimmedPrompt = prompt.trim()
+    // Catalog-driven validation: refuse to spawn a worker against a model the
+    // catalog does not know. The server's runtimeFromCatalogEntry would throw
+    // anyway; surfacing it here gives the operator a list of valid ids.
+    if (catalog && !catalog.models.some((m) => m.id === trimmedModelId)) {
+      toast.error(`Unknown model "${trimmedModelId}". Available: ${catalog.models.map((m) => m.id).join(', ')}`)
+      return
+    }
     setAgents((prev) => [...prev, { id: nextId, status: 'active', modelId: trimmedModelId, runtimeKind }])
     socketRef.current?.send(JSON.stringify({
       action: 'spawn_agent', agentId: nextId, prompt: trimmedPrompt, modelId: trimmedModelId, runtimeKind,
       safetyMode,
     }))
     toast.success(`Spawned ${nextId}`)
-  }, [agents.length, modelId, prompt, runtimeKind, safetyMode])
+  }, [agents.length, modelId, prompt, runtimeKind, safetyMode, catalog])
 
   const handleSend = useCallback(() => {
     const trimmed = inputMessage.trim()
@@ -703,6 +812,7 @@ export default function HarnessDashboard() {
       content: trimmed,
       timestamp: Date.now(),
       attachments: pendingFiles.length > 0 ? pendingFiles : undefined,
+      ...(mediaMode ? { mediaMode } : {}),
     }
     setChatMessages((prev) => [...prev, userMessage])
     setIsStreaming(true)
@@ -711,10 +821,15 @@ export default function HarnessDashboard() {
       payload: trimmed,
       attachments: pendingFiles.map((f) => ({ name: f.name, size: f.size, type: f.type })),
       safetyMode,
+      ...(mediaMode ? { mediaMode } : {}),
     }))
     setInputMessage('')
     setPendingFiles([])
-  }, [inputMessage, connected, isStreaming, pendingFiles, safetyMode])
+    // Clear mediaMode after send — finite-Credit protection. The user can
+    // re-activate it for the next message if they want a series; defaults
+    // back to safe text-only routing otherwise.
+    setMediaMode(null)
+  }, [inputMessage, connected, isStreaming, pendingFiles, safetyMode, mediaMode])
 
   const stopGeneration = useCallback(() => {
     if (!isStreaming) return
@@ -989,6 +1104,17 @@ export default function HarnessDashboard() {
       setTimeout(() => paletteInputRef.current?.focus(), 0)
     }
   }, [showPalette])
+
+  /* ── Close media menu on outside click ── */
+  useEffect(() => {
+    if (!showMediaMenu) return
+    function handleClick(e: MouseEvent) {
+      const target = e.target as HTMLElement
+      if (!target.closest('[data-media-menu]')) setShowMediaMenu(false)
+    }
+    document.addEventListener('click', handleClick)
+    return () => document.removeEventListener('click', handleClick)
+  }, [showMediaMenu])
 
   /* ── Close model dropdown on outside click ── */
   useEffect(() => {
@@ -1331,6 +1457,68 @@ export default function HarnessDashboard() {
                   </div>
                 )}
                 <div className="flex items-end gap-2 rounded-2xl bg-mm-surface px-4 py-3">
+                  {/* Media-mode selector ("+" button).
+                      Click → menu: Image / Video / Audio / Music. Selecting one
+                      sets mediaMode on the outgoing message so the runtime
+                      media-gate permits matching media tools. Without an
+                      active mode, the gate blocks all media tool calls and
+                      the Governor-0 prompt instructs the model to ASK rather
+                      than CALL. The active mode is shown as a dismissible
+                      chip; the menu can also re-open to switch modes. */}
+                  <div className="relative shrink-0" data-media-menu>
+                    <button
+                      onClick={() => setShowMediaMenu((v) => !v)}
+                      className={`nav-item-transition flex items-center justify-center rounded-lg p-1.5 ${mediaMode ? 'text-mm-accent' : 'text-mm-text-tertiary hover:bg-mm-surface-hover hover:text-mm-text-secondary'}`}
+                      aria-label="Media generation mode"
+                      title={mediaMode ? `Media mode: ${mediaMode} (click to change)` : 'Activate media generation mode'}
+                    >
+                      <Plus size={18} />
+                    </button>
+                    {showMediaMenu && (
+                      <div className="absolute bottom-full left-0 z-50 mb-2 w-72 rounded-xl border border-mm-border bg-mm-surface p-2 shadow-lg">
+                        <div className="mb-1 px-2 pt-1 text-[10px] font-medium uppercase tracking-wider text-mm-text-tertiary">Media Mode</div>
+                        <p className="mb-2 px-2 text-[11px] leading-snug text-mm-text-tertiary">
+                          Activates the runtime media gate for the next message. The model cannot call media tools without this.
+                        </p>
+                        {MEDIA_MODE_OPTIONS.map((opt) => (
+                          <button
+                            key={opt.mode}
+                            onClick={() => { setMediaMode(opt.mode); setShowMediaMenu(false); toast.success(`Media mode: ${opt.label}`) }}
+                            className={`mb-0.5 flex w-full flex-col items-start gap-0.5 rounded-lg px-3 py-2 text-left hover:bg-mm-surface-hover ${mediaMode === opt.mode ? 'bg-mm-surface-active' : ''}`}
+                          >
+                            <div className="flex w-full items-center justify-between">
+                              <span className="text-[13px] font-medium text-mm-text">{opt.label}</span>
+                              {mediaMode === opt.mode && <Check size={12} className="text-mm-accent" />}
+                            </div>
+                            <span className="text-[11px] text-mm-text-tertiary">{opt.hint}</span>
+                          </button>
+                        ))}
+                        {mediaMode && (
+                          <button
+                            onClick={() => { setMediaMode(null); setShowMediaMenu(false); toast.info('Media mode cleared') }}
+                            className="mt-1 w-full rounded-lg border border-mm-border px-3 py-1.5 text-left text-[12px] text-mm-text-secondary hover:bg-mm-surface-hover"
+                          >
+                            Clear media mode
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {mediaMode && (
+                    <div className="flex shrink-0 items-center gap-1.5 self-center rounded-lg bg-mm-accent/15 px-2 py-1 text-[11px] font-medium text-mm-accent">
+                      <Sparkles size={11} />
+                      <span className="capitalize">{mediaMode}</span>
+                      <button
+                        onClick={() => setMediaMode(null)}
+                        className="rounded hover:bg-mm-accent/25"
+                        aria-label={`Clear ${mediaMode} media mode`}
+                      >
+                        <X size={11} />
+                      </button>
+                    </div>
+                  )}
+
                   <button
                     onClick={() => fileInputRef.current?.click()}
                     className="nav-item-transition shrink-0 rounded-lg p-1.5 text-mm-text-tertiary hover:bg-mm-surface-hover hover:text-mm-text-secondary"
@@ -1365,25 +1553,48 @@ export default function HarnessDashboard() {
                       className="nav-item-transition flex max-w-[200px] items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12px] text-mm-text-secondary hover:bg-mm-surface-hover focus:outline-none focus:ring-1 focus:ring-mm-accent/50"
                       title={modelId}
                     >
-                      <span className="truncate">{PRESET_MODELS.find(m => m.id === modelId)?.label ?? modelId.split('/').pop() ?? 'Model'}</span>
+                      <span className="truncate">{catalogModelLabel(modelId)}</span>
                       <ChevronDown size={12} className="shrink-0" />
                     </button>
                     {showModelDropdown && (
                       <div className="absolute bottom-full right-0 z-50 mb-2 w-80 rounded-xl border border-mm-border bg-mm-surface p-2 shadow-lg">
-                        <div className="mb-2 px-2 pt-1 text-[10px] font-medium uppercase tracking-wider text-mm-text-tertiary">Preset Models</div>
-                        {PRESET_MODELS.map((m) => (
-                          <button
-                            key={m.id}
-                            onClick={() => { setModelId(m.id); setShowModelDropdown(false); toast.success(`Switched to ${m.label}`) }}
-                            className={`mb-0.5 flex w-full flex-col items-start gap-0.5 rounded-lg px-3 py-2 text-left hover:bg-mm-surface-hover ${modelId === m.id ? 'bg-mm-surface-active' : ''}`}
-                          >
-                            <div className="flex w-full items-center justify-between">
-                              <span className="text-[13px] font-medium text-mm-text">{m.label}</span>
-                              {modelId === m.id && <Check size={12} className="text-mm-accent" />}
+                        {catalogByProvider.length > 0 ? (
+                          catalogByProvider.map((group) => (
+                            <div key={group.providerId} className="mb-1">
+                              <div className="mb-1 mt-1 px-2 text-[10px] font-medium uppercase tracking-wider text-mm-text-tertiary">
+                                {group.providerName}
+                              </div>
+                              {group.models.map((m) => {
+                                const isDefault = catalog?.defaults.primaryModelId === m.id
+                                const inputBadge = [
+                                  m.modalities.input.includes('video') ? 'video' : null,
+                                  m.modalities.input.includes('image') ? 'image' : null,
+                                ].filter(Boolean).join('+')
+                                return (
+                                  <button
+                                    key={m.id}
+                                    onClick={() => { setModelId(m.id); setShowModelDropdown(false); toast.success(`Switched to ${m.displayName}`) }}
+                                    className={`mb-0.5 flex w-full flex-col items-start gap-0.5 rounded-lg px-3 py-2 text-left hover:bg-mm-surface-hover ${modelId === m.id ? 'bg-mm-surface-active' : ''}`}
+                                  >
+                                    <div className="flex w-full items-center justify-between">
+                                      <span className="text-[13px] font-medium text-mm-text">{m.displayName}</span>
+                                      <span className="flex items-center gap-1.5">
+                                        {inputBadge && <span className="rounded bg-mm-surface-hover px-1.5 py-0.5 text-[9px] font-mono uppercase text-mm-text-tertiary">{inputBadge}</span>}
+                                        {m.planCoverage === 'unverified' && <span className="rounded bg-mm-red/15 px-1.5 py-0.5 text-[9px] font-mono uppercase text-mm-red" title="Coverage on this provider's plan is not verified">unverified</span>}
+                                        {modelId === m.id && <Check size={12} className="text-mm-accent" />}
+                                      </span>
+                                    </div>
+                                    <span className="text-[11px] text-mm-text-tertiary">
+                                      {isDefault ? 'Catalog default' : m.roles.slice(0, 2).join(' · ') || m.id}
+                                    </span>
+                                  </button>
+                                )
+                              })}
                             </div>
-                            <span className="text-[11px] text-mm-text-tertiary">{m.description}</span>
-                          </button>
-                        ))}
+                          ))
+                        ) : (
+                          <div className="px-3 py-3 text-[12px] text-mm-text-tertiary">Loading catalog…</div>
+                        )}
                         <div className="mt-2 border-t border-mm-border pt-2">
                           <label className="mb-1 block px-2 text-[10px] font-medium uppercase tracking-wider text-mm-text-tertiary">Custom</label>
                           <input
@@ -1391,7 +1602,7 @@ export default function HarnessDashboard() {
                             onChange={(e) => setModelId(e.target.value)}
                             onKeyDown={(e) => { if (e.key === 'Enter') setShowModelDropdown(false) }}
                             className="w-full rounded-lg border border-mm-border bg-mm-main-bg px-3 py-2 text-[12px] text-mm-text outline-none focus:border-mm-accent"
-                            placeholder="org/model-name"
+                            placeholder="catalog model id"
                           />
                         </div>
                       </div>

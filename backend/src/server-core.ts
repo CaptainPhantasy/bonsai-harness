@@ -1,6 +1,7 @@
-import { join, normalize, isAbsolute } from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join, normalize, isAbsolute, dirname, resolve } from "node:path";
+import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { isSafetyMode, type SafetyMode } from "./safety-modes";
+import { isMediaMode, type MediaMode } from "./media-policy";
 
 export type ModelRuntimeKind = "openai-compatible" | "anthropic";
 
@@ -8,6 +9,15 @@ export const DEFAULT_PORT = 11431;
 export const DEFAULT_BIND_HOST = "127.0.0.1";
 export const DEFAULT_MAX_ACTIVE_AGENTS = 2;
 export const DEFAULT_SANDBOX_ROOT = "/Volumes/SanDisk1Tb/bonsai-harness/sandbox";
+export const DEFAULT_PROJECT_ROOT = "/Volumes/SanDisk1Tb/bonsai-harness";
+/**
+ * Reserved per-project memory root. NEVER global (~/.bonsai). Decision 6
+ * (LOCKED): memory is filesystem-scoped to project root, enforced by
+ * filesystem ignorance, not policy prose.
+ */
+export const MEMORY_DIR_NAME = ".bonsai";
+export const MEMORY_SUBDIR = "memory";
+export const CONVERSATIONS_SUBDIR = "conversations";
 export const DEFAULT_MODEL_ID = "gpt-4o-mini";
 export const DEFAULT_API_BASE_URL = "https://api.openai.com";
 export const DEFAULT_API_PATH = "/v1/chat/completions";
@@ -57,6 +67,12 @@ export type SendMessage = {
   payload: string;
   attachments?: { name: string; size: number; type: string }[];
   safetyMode?: SafetyMode;
+  /**
+   * Media generation mode. Set ONLY by an explicit UI affordance (the
+   * composer's "+" menu → pick Image / Video / Audio / Music). When
+   * undefined, no media tools may run regardless of prompt phrasing.
+   */
+  mediaMode?: MediaMode;
 };
 
 export type StopGenerationMessage = {
@@ -75,12 +91,13 @@ export type HarnessEvent =
   | { type: "status"; payload: string }
   | { type: "error"; payload: string; agentId?: string }
   | { type: "inference"; agentId: string; payload: string }
+  | { type: "inference_delta"; agentId: string; payload: string; channel: "content" | "reasoning" }
   | { type: "agent_exit"; agentId: string; code: number | null; signal: NodeJS.Signals | null }
   | { type: "mcp_response"; server: string; payload: string }
   | { type: "tool_approval_required"; requestId: string; agentId: string; server: string; tool: string; arguments: Record<string, unknown> }
   | { type: "sandbox_write"; path: string; payload: string };
 
-type HarnessEnv = NodeJS.ProcessEnv | {
+export type HarnessEnv = NodeJS.ProcessEnv | {
   PORT?: string | undefined;
   HARNESS_BIND_HOST?: string | undefined;
   HARNESS_MODEL_ID?: string | undefined;
@@ -96,6 +113,13 @@ type HarnessEnv = NodeJS.ProcessEnv | {
   ANTHROPIC_API_BASE_URL?: string | undefined;
   ANTHROPIC_API_MAX_TOKENS?: string | undefined;
   ANTHROPIC_API_TEMPERATURE?: string | undefined;
+  HARNESS_BACKUP_API_BASE_URL?: string | undefined;
+  HARNESS_BACKUP_API_PATH?: string | undefined;
+  HARNESS_BACKUP_API_KEY?: string | undefined;
+  HARNESS_BACKUP_MODEL_ID?: string | undefined;
+  HARNESS_BACKUP_API_MAX_TOKENS?: string | undefined;
+  HARNESS_BACKUP_API_TEMPERATURE?: string | undefined;
+  HARNESS_PROJECT_ROOT?: string | undefined;
 };
 
 export function resolvePort(env: HarnessEnv = process.env): number {
@@ -117,6 +141,60 @@ export function resolveMaxActiveAgents(env: HarnessEnv = process.env): number {
 export function resolveSandboxRoot(env: HarnessEnv = process.env): string {
   const raw = env.HARNESS_SANDBOX_ROOT?.trim();
   return raw && raw.length > 0 ? raw : DEFAULT_SANDBOX_ROOT;
+}
+
+/**
+ * Resolve and validate the project root. The project root scopes every
+ * per-project artifact (memory, conversation logs, catalog) — it is locked
+ * at module load (see PROJECT_ROOT below) and never re-read at request time.
+ *
+ * Validation:
+ *   - Must be absolute (relative roots would resolve against CWD, which is
+ *     not deterministic across launch contexts).
+ *   - Must exist and be a directory.
+ *   - Must contain either a package.json or a FLOYD.md marker — guards
+ *     against accidentally pointing at a parent or sibling directory.
+ *
+ * Honors HARNESS_PROJECT_ROOT when set; otherwise falls back to
+ * DEFAULT_PROJECT_ROOT. Fallback exists for container/test launches where
+ * process.cwd() is not the project root.
+ */
+export function resolveProjectRoot(env: HarnessEnv = process.env): string {
+  const raw = env.HARNESS_PROJECT_ROOT?.trim() || DEFAULT_PROJECT_ROOT;
+  const absolute = isAbsolute(raw) ? resolve(raw) : resolve(process.cwd(), raw);
+  if (!existsSync(absolute)) {
+    throw new Error(`HARNESS_PROJECT_ROOT does not exist: ${absolute}`);
+  }
+  let stat;
+  try {
+    stat = statSync(absolute);
+  } catch (error) {
+    throw new Error(`HARNESS_PROJECT_ROOT is not stat-able: ${absolute} (${String(error)})`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`HARNESS_PROJECT_ROOT must be a directory: ${absolute}`);
+  }
+  const hasMarker = existsSync(join(absolute, "package.json")) || existsSync(join(absolute, "FLOYD.md"));
+  if (!hasMarker) {
+    throw new Error(`HARNESS_PROJECT_ROOT must contain package.json or FLOYD.md: ${absolute}`);
+  }
+  return absolute;
+}
+
+/**
+ * The resolved project root, captured at module load. This is the ONLY
+ * project root the rest of the runtime may consult. Tests that need a
+ * different root pass an explicit env to resolveProjectRoot(); they do NOT
+ * reassign this const.
+ */
+export const PROJECT_ROOT: string = resolveProjectRoot(process.env as HarnessEnv);
+
+/**
+ * Accessor for PROJECT_ROOT. Provided so callers express intent ("get the
+ * locked root") rather than reaching into a top-level const.
+ */
+export function getProjectRoot(): string {
+  return PROJECT_ROOT;
 }
 
 export function resolveDefaultModelId(env: HarnessEnv = process.env): string {
@@ -179,6 +257,32 @@ export function resolveApiKey(env: HarnessEnv = process.env): string {
 export function resolveAnthropicApiKey(env: HarnessEnv = process.env): string {
   const apiKey = env.ANTHROPIC_API_KEY?.trim();
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY is required for anthropic runtime");
+  return apiKey;
+}
+
+/**
+ * Built-in backup OpenAI-compatible runtime. Returns null when no backup is
+ * configured (no HARNESS_BACKUP_API_BASE_URL). When a base URL is set, the key
+ * is required. Used for primary→backup failover in the OpenAI-compatible agent.
+ */
+export function resolveBackupOpenAiRuntime(env: HarnessEnv = process.env): OpenAiCompatibleRuntime | null {
+  const apiBaseUrl = env.HARNESS_BACKUP_API_BASE_URL?.trim().replace(/\/+$/, "");
+  if (!apiBaseUrl) return null;
+  const apiKey = env.HARNESS_BACKUP_API_KEY?.trim();
+  if (!apiKey) throw new Error("HARNESS_BACKUP_API_KEY is required when HARNESS_BACKUP_API_BASE_URL is set");
+  return {
+    kind: "openai-compatible",
+    modelId: env.HARNESS_BACKUP_MODEL_ID?.trim() || DEFAULT_MODEL_ID,
+    apiBaseUrl,
+    apiPath: normalizeApiPath(env.HARNESS_BACKUP_API_PATH?.trim() || DEFAULT_API_PATH),
+    maxTokens: resolveBoundedNumber(env.HARNESS_BACKUP_API_MAX_TOKENS, DEFAULT_API_MAX_TOKENS, "HARNESS_BACKUP_API_MAX_TOKENS", 1, 128_000),
+    temperature: resolveBoundedNumber(env.HARNESS_BACKUP_API_TEMPERATURE, DEFAULT_API_TEMPERATURE, "HARNESS_BACKUP_API_TEMPERATURE", 0, 2),
+  };
+}
+
+export function resolveBackupApiKey(env: HarnessEnv = process.env): string {
+  const apiKey = env.HARNESS_BACKUP_API_KEY?.trim();
+  if (!apiKey) throw new Error("HARNESS_BACKUP_API_KEY is required for backup runtime");
   return apiKey;
 }
 
@@ -296,6 +400,48 @@ export function createSandboxPath(filename: string, sandboxRoot: string): string
   return join(sandboxRoot, safeFilename);
 }
 
+/**
+ * Resolve a path inside the per-project memory directory
+ * (`<projectRoot>/.bonsai/memory/<relativePath>`).
+ *
+ * Same containment discipline as createSandboxPath, but rooted at the
+ * project-scoped memory tree. Used by conversation logging (I-06) and any
+ * future per-project memory artifact. Rejects absolute paths, `..`
+ * traversal, and empty input. The caller is responsible for mkdirSync on
+ * the returned path's parent (resolved paths are not auto-created here so
+ * that read paths can be checked without side effects).
+ *
+ * Decision 6 (LOCKED): memory is filesystem-scoped to PROJECT_ROOT, never
+ * global. This function is the ONLY sanctioned entry point for memory
+ * paths; constructing them by hand is a governance failure.
+ */
+export function resolveMemoryPath(relativePath: string, projectRoot: string = PROJECT_ROOT): string {
+  if (!relativePath || relativePath.trim().length === 0) {
+    throw new Error("memory relativePath must be non-empty");
+  }
+  const normalized = normalize(relativePath).replace(/^\.\.(\/|\\|$)/, "");
+  if (isAbsolute(normalized) || normalized.startsWith("..")) {
+    throw new Error("memory relativePath must be a relative path within the project memory root");
+  }
+  const safeRelative = normalized.replace(/[^A-Za-z0-9._\-/]/g, "_");
+  return join(projectRoot, MEMORY_DIR_NAME, MEMORY_SUBDIR, safeRelative);
+}
+
+/**
+ * Returns the absolute path to the memory root for the given project.
+ * Convenience for callers that need to mkdirSync the tree before writing.
+ */
+export function getMemoryRoot(projectRoot: string = PROJECT_ROOT): string {
+  return join(projectRoot, MEMORY_DIR_NAME, MEMORY_SUBDIR);
+}
+
+/**
+ * Returns the absolute path to the conversations subdirectory.
+ */
+export function getConversationsDir(projectRoot: string = PROJECT_ROOT): string {
+  return join(projectRoot, MEMORY_DIR_NAME, MEMORY_SUBDIR, CONVERSATIONS_SUBDIR);
+}
+
 export function parseClientMessage(message: string | Buffer): ClientMessage {
   let parsed: unknown;
   try {
@@ -358,11 +504,15 @@ export function parseClientMessage(message: string | Buffer): ClientMessage {
     if (parsed.safetyMode !== undefined && !isSafetyMode(parsed.safetyMode)) {
       throw new Error("send_message safetyMode must be one of: plan, ask, auto, yolo");
     }
+    if (parsed.mediaMode !== undefined && !isMediaMode(parsed.mediaMode)) {
+      throw new Error("send_message mediaMode must be one of: image, video, audio, music");
+    }
     return {
       action: "send_message",
       payload: parsed.payload,
       ...(attachments ? { attachments } : {}),
       ...(parsed.safetyMode ? { safetyMode: parsed.safetyMode } : {}),
+      ...(parsed.mediaMode ? { mediaMode: parsed.mediaMode } : {}),
     };
   }
 
