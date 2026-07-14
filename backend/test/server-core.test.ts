@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  DEFAULT_PROJECT_ROOT,
   assertSpawnCapacity,
   buildAnthropicRequest,
   buildAnthropicConversationRequest,
@@ -357,12 +358,12 @@ describe("server core", () => {
   });
 
   test("resolveProjectRoot accepts the canonical project root and rejects non-project dirs", () => {
-    expect(resolveProjectRoot({})).toBe("/Volumes/SanDisk1Tb/bonsai-harness");
-    expect(resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/Volumes/SanDisk1Tb/bonsai-harness" })).toBe("/Volumes/SanDisk1Tb/bonsai-harness");
+    expect(resolveProjectRoot({})).toBe(DEFAULT_PROJECT_ROOT);
+    expect(resolveProjectRoot({ HARNESS_PROJECT_ROOT: DEFAULT_PROJECT_ROOT })).toBe(DEFAULT_PROJECT_ROOT);
     expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/tmp" })).toThrow("package.json or FLOYD.md");
-    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/Volumes/SanDisk1Tb/bonsai-harness/backend/src" })).toThrow("package.json or FLOYD.md");
-    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/Volumes/SanDisk1Tb/bonsai-harness/nonexistent-dir-xyz" })).toThrow("does not exist");
-    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: "/Volumes/SanDisk1Tb/bonsai-harness/FLOYD.md" })).toThrow("must be a directory");
+    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: `${DEFAULT_PROJECT_ROOT}/backend/src` })).toThrow("package.json or FLOYD.md");
+    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: `${DEFAULT_PROJECT_ROOT}/nonexistent-dir-xyz` })).toThrow("does not exist");
+    expect(() => resolveProjectRoot({ HARNESS_PROJECT_ROOT: `${DEFAULT_PROJECT_ROOT}/package.json` })).toThrow("must be a directory");
   });
 
   test("resolveMemoryPath scopes paths under <projectRoot>/.bonsai/memory and rejects escapes", () => {

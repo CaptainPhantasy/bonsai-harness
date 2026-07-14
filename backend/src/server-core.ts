@@ -9,7 +9,7 @@ export const DEFAULT_PORT = 11431;
 export const DEFAULT_BIND_HOST = "127.0.0.1";
 export const DEFAULT_MAX_ACTIVE_AGENTS = 2;
 export const DEFAULT_SANDBOX_ROOT = "/Volumes/SanDisk1Tb/bonsai-harness/sandbox";
-export const DEFAULT_PROJECT_ROOT = "/Volumes/SanDisk1Tb/bonsai-harness";
+export const DEFAULT_PROJECT_ROOT = resolve(import.meta.dir, "..", "..");
 /**
  * Reserved per-project memory root. NEVER global (~/.bonsai). Decision 6
  * (LOCKED): memory is filesystem-scoped to project root, enforced by
@@ -155,9 +155,9 @@ export function resolveSandboxRoot(env: HarnessEnv = process.env): string {
  *   - Must contain either a package.json or a FLOYD.md marker — guards
  *     against accidentally pointing at a parent or sibling directory.
  *
- * Honors HARNESS_PROJECT_ROOT when set; otherwise falls back to
- * DEFAULT_PROJECT_ROOT. Fallback exists for container/test launches where
- * process.cwd() is not the project root.
+ * Honors HARNESS_PROJECT_ROOT when set; otherwise resolves the repository root
+ * from this module. Production launchers may still set HARNESS_PROJECT_ROOT;
+ * the module-relative fallback keeps clean checkouts and CI portable.
  */
 export function resolveProjectRoot(env: HarnessEnv = process.env): string {
   const raw = env.HARNESS_PROJECT_ROOT?.trim() || DEFAULT_PROJECT_ROOT;
