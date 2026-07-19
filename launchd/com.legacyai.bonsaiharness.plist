@@ -41,12 +41,14 @@
         <string>/Users/douglastalley/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PORT</key>
         <string>11431</string>
+        <key>HARNESS_BIND_HOST</key>
+        <string>127.0.0.1</string>
         <key>HARNESS_SANDBOX_ROOT</key>
         <string>/Volumes/SanDisk1Tb/bonsai-harness/sandbox</string>
         <key>HARNESS_RUNTIME_KIND</key>
-        <string>local-command</string>
+        <string>openai-compatible</string>
         <key>HARNESS_MODEL_ID</key>
-        <string>prism-ml/Ternary-Bonsai-8B-mlx-2bit</string>
+        <string>gpt-4o-mini</string>
     </dict>
     <key>SoftResourceLimits</key>
     <dict>

@@ -6,15 +6,19 @@ services:
     environment:
       PORT: "11431"
       HARNESS_MAX_ACTIVE_AGENTS: "2"
+      HARNESS_BIND_HOST: 0.0.0.0
+      HARNESS_ALLOWED_ORIGINS: http://127.0.0.1:11432,http://localhost:11432
       HARNESS_SANDBOX_ROOT: /app/sandbox
-      HARNESS_RUNNER_BINARY: ${HARNESS_RUNNER_BINARY:-/bin/echo}
-      HARNESS_RUNNER_ARGS_TEMPLATE: "{{runtimeKind}} --model {{modelId}} --prompt {{prompt}}"
-      HARNESS_MODEL_CACHE_DIR: /app/models
-      HARNESS_CACHE_DIR: /app/mlx-cache
+      HARNESS_RUNTIME_KIND: ${HARNESS_RUNTIME_KIND:-openai-compatible}
+      HARNESS_API_BASE_URL: ${HARNESS_API_BASE_URL:-https://api.openai.com}
+      HARNESS_API_PATH: ${HARNESS_API_PATH:-/v1/chat/completions}
+      HARNESS_MODEL_ID: ${HARNESS_MODEL_ID:-gpt-4o-mini}
+      HARNESS_API_KEY: ${HARNESS_API_KEY:-}
+      ANTHROPIC_API_BASE_URL: ${ANTHROPIC_API_BASE_URL:-https://api.anthropic.com}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     ports:
-      - "11431:11431"
+      - "127.0.0.1:11431:11431"
     volumes:
-      - ./logs:/app/logs
       - ./sandbox:/app/sandbox
     healthcheck:
       test: ["CMD", "bun", "-e", "const r=await fetch('http://127.0.0.1:11431/health'); if(!r.ok) process.exit(1)"]
@@ -27,9 +31,9 @@ services:
     working_dir: /app/frontend
     command: sh -lc "bun install --frozen-lockfile && bun run dev -- --host 0.0.0.0 --port 11432"
     environment:
-      VITE_HARNESS_BACKEND_URL: http://localhost:11431
+      HARNESS_BACKEND_PROXY_TARGET: http://backend:11431
     ports:
-      - "11432:11432"
+      - "127.0.0.1:11432:11432"
     volumes:
       - ./frontend:/app/frontend
     depends_on:

@@ -8,6 +8,13 @@ if (!healthResponse.ok) {
 const health = await healthResponse.json();
 console.log("health", JSON.stringify(health));
 
+if (health.ok !== true) {
+  throw new Error(`provider configuration is not ready: ${String(health.error ?? "unknown error")}`);
+}
+if (health.runtimeKind !== "openai-compatible" && health.runtimeKind !== "anthropic") {
+  throw new Error(`unsupported runtime: ${String(health.runtimeKind)}`);
+}
+
 const received: string[] = [];
 const ws = new WebSocket(wsUrl);
 
@@ -19,8 +26,8 @@ await new Promise<void>((resolve, reject) => {
       action: "spawn_agent",
       agentId: "Smoke-01",
       prompt: "smoke prompt",
-      modelId: "smoke/slm",
-      runtimeKind: "local-command",
+      modelId: process.env.HARNESS_SMOKE_MODEL_ID ?? health.modelId,
+      runtimeKind: health.runtimeKind,
     }));
   });
 
